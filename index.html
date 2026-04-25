@@ -189,6 +189,54 @@
     color: var(--muted); font-size: 12px; text-align: center;
   }
   footer a { color: inherit; }
+
+  /* ---- Weather strip ---- */
+  .weather {
+    max-width: 1400px; margin: 14px auto 0; padding: 0 16px;
+  }
+  .weather-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    box-shadow: var(--shadow);
+    padding: 14px 18px;
+    display: flex; align-items: center; gap: 22px;
+    flex-wrap: wrap;
+  }
+  .weather-now {
+    display: flex; align-items: center; gap: 14px;
+    min-width: 240px;
+  }
+  .weather-icon { font-size: 40px; line-height: 1; }
+  .weather-temp {
+    font-size: 32px; font-weight: 700; letter-spacing: -0.02em;
+    line-height: 1;
+  }
+  .weather-meta { color: var(--muted); font-size: 12.5px; line-height: 1.4; }
+  .weather-meta b { color: var(--text); font-weight: 600; }
+  .weather-loc { font-size: 14px; font-weight: 650; margin-bottom: 2px; }
+  .weather-divider {
+    width: 1px; align-self: stretch; background: var(--border);
+  }
+  .weather-forecast {
+    display: flex; gap: 14px; flex: 1 1 auto; flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+  .weather-day {
+    display: flex; flex-direction: column; align-items: center;
+    gap: 2px; min-width: 56px;
+  }
+  .weather-day .d { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
+  .weather-day .i { font-size: 22px; line-height: 1; }
+  .weather-day .t { font-size: 12.5px; }
+  .weather-day .t b { font-weight: 650; }
+  .weather-error { color: var(--muted); font-size: 13px; }
+  @media (max-width: 720px) {
+    .weather-card { padding: 12px 14px; gap: 12px; }
+    .weather-divider { display: none; }
+    .weather-forecast { justify-content: flex-start; gap: 10px; }
+    .weather-day { min-width: 48px; }
+  }
 </style>
 </head>
 <body>
@@ -205,6 +253,12 @@
     <button class="refresh" id="refresh-btn" title="Refresh now">↻ Refresh</button>
   </div>
 </header>
+
+<div class="weather">
+  <div class="weather-card" id="weather-card">
+    <div class="weather-error">Loading Cortland weather…</div>
+  </div>
+</div>
 
 <main>
   <section class="col" id="col-local">
@@ -621,6 +675,108 @@ async function loadAll(manual = false) {
 
 loadAll();
 setInterval(loadAll, REFRESH_MS);
+
+/* ---- Cortland weather (Open-Meteo, no API key) ----------------- */
+const WEATHER_URL =
+  "https://api.open-meteo.com/v1/forecast" +
+  "?latitude=42.6012&longitude=-76.1805" +
+  "&current=temperature_2m,weather_code,wind_speed_10m,relative_humidity_2m,apparent_temperature" +
+  "&daily=temperature_2m_max,temperature_2m_min,weather_code,precipitation_probability_max" +
+  "&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch" +
+  "&timezone=America/New_York&forecast_days=5";
+const WEATHER_REFRESH_MS = 15 * 60 * 1000; // 15 minutes
+const weatherCard = $("#weather-card");
+
+// WMO weather code → { label, emoji }. Day icons; close enough at night.
+function wmo(code) {
+  const m = {
+    0:  ["Clear",            "☀️"],
+    1:  ["Mostly clear",     "🌤️"],
+    2:  ["Partly cloudy",    "⛅"],
+    3:  ["Overcast",         "☁️"],
+    45: ["Fog",              "🌫️"],
+    48: ["Freezing fog",     "🌫️"],
+    51: ["Light drizzle",    "🌦️"],
+    53: ["Drizzle",          "🌦️"],
+    55: ["Heavy drizzle",    "🌧️"],
+    56: ["Freezing drizzle", "🌧️"],
+    57: ["Freezing drizzle", "🌧️"],
+    61: ["Light rain",       "🌦️"],
+    63: ["Rain",             "🌧️"],
+    65: ["Heavy rain",       "🌧️"],
+    66: ["Freezing rain",    "🌧️"],
+    67: ["Freezing rain",    "🌧️"],
+    71: ["Light snow",       "🌨️"],
+    73: ["Snow",             "🌨️"],
+    75: ["Heavy snow",       "❄️"],
+    77: ["Snow grains",      "🌨️"],
+    80: ["Rain showers",     "🌦️"],
+    81: ["Rain showers",     "🌧️"],
+    82: ["Heavy showers",    "⛈️"],
+    85: ["Snow showers",     "🌨️"],
+    86: ["Snow showers",     "❄️"],
+    95: ["Thunderstorm",     "⛈️"],
+    96: ["T-storm w/ hail",  "⛈️"],
+    99: ["T-storm w/ hail",  "⛈️"],
+  };
+  return m[code] || ["—", "·"];
+}
+
+function dayLabel(isoDate, idx) {
+  if (idx === 0) return "Today";
+  const d = new Date(isoDate + "T12:00:00");
+  return d.toLocaleDateString(undefined, { weekday: "short" });
+}
+
+async function loadWeather() {
+  try {
+    const res = await fetch(WEATHER_URL, { cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    const cur = data.current, day = data.daily;
+    const [curLabel, curIcon] = wmo(cur.weather_code);
+
+    const forecastHtml = day.time.map((iso, i) => {
+      const [, ic] = wmo(day.weather_code[i]);
+      const hi = Math.round(day.temperature_2m_max[i]);
+      const lo = Math.round(day.temperature_2m_min[i]);
+      const pop = day.precipitation_probability_max[i];
+      const popTxt = (pop != null && pop >= 20) ? ` · ${pop}%` : "";
+      return `
+        <div class="weather-day" title="${escapeHtml(wmo(day.weather_code[i])[0])}${popTxt ? ' · ' + pop + '% precip' : ''}">
+          <div class="d">${escapeHtml(dayLabel(iso, i))}</div>
+          <div class="i">${ic}</div>
+          <div class="t"><b>${hi}°</b> <span style="color:var(--muted)">${lo}°</span></div>
+        </div>`;
+    }).join("");
+
+    weatherCard.innerHTML = `
+      <div class="weather-now">
+        <div class="weather-icon">${curIcon}</div>
+        <div>
+          <div class="weather-loc">Cortland, NY</div>
+          <div style="display:flex;align-items:baseline;gap:10px;">
+            <div class="weather-temp">${Math.round(cur.temperature_2m)}°F</div>
+            <div class="weather-meta">${escapeHtml(curLabel)}</div>
+          </div>
+          <div class="weather-meta">
+            Feels <b>${Math.round(cur.apparent_temperature)}°</b> ·
+            Wind <b>${Math.round(cur.wind_speed_10m)} mph</b> ·
+            Humidity <b>${cur.relative_humidity_2m}%</b>
+          </div>
+        </div>
+      </div>
+      <div class="weather-divider"></div>
+      <div class="weather-forecast">${forecastHtml}</div>
+    `;
+  } catch (e) {
+    weatherCard.innerHTML =
+      `<div class="weather-error">Weather unavailable right now (${escapeHtml(e.message || "error")})</div>`;
+  }
+}
+
+loadWeather();
+setInterval(loadWeather, WEATHER_REFRESH_MS);
 </script>
 </body>
 </html>
