@@ -194,6 +194,14 @@
   .weather {
     max-width: 1400px; margin: 14px auto 0; padding: 0 16px;
   }
+  .weather-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+  }
+  @media (max-width: 1100px) {
+    .weather-grid { grid-template-columns: 1fr; }
+  }
   .weather-card {
     background: var(--bg-card);
     border: 1px solid var(--border);
@@ -255,8 +263,13 @@
 </header>
 
 <div class="weather">
-  <div class="weather-card" id="weather-card">
-    <div class="weather-error">Loading Cortland weather…</div>
+  <div class="weather-grid">
+    <div class="weather-card" id="wx-cortland">
+      <div class="weather-error">Loading Cortland weather…</div>
+    </div>
+    <div class="weather-card" id="wx-ithaca">
+      <div class="weather-error">Loading Ithaca weather…</div>
+    </div>
   </div>
 </div>
 
@@ -676,16 +689,21 @@ async function loadAll(manual = false) {
 loadAll();
 setInterval(loadAll, REFRESH_MS);
 
-/* ---- Cortland weather (Open-Meteo, no API key) ----------------- */
-const WEATHER_URL =
-  "https://api.open-meteo.com/v1/forecast" +
-  "?latitude=42.6012&longitude=-76.1805" +
-  "&current=temperature_2m,weather_code,wind_speed_10m,relative_humidity_2m,apparent_temperature" +
-  "&daily=temperature_2m_max,temperature_2m_min,weather_code,precipitation_probability_max" +
-  "&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch" +
-  "&timezone=America/New_York&forecast_days=5";
+/* ---- Weather (Open-Meteo, no API key) -------------------------- */
+const LOCATIONS = [
+  { id: "cortland", name: "Cortland, NY", lat: 42.6012, lon: -76.1805 },
+  { id: "ithaca",   name: "Ithaca, NY",   lat: 42.4440, lon: -76.5019 },
+];
 const WEATHER_REFRESH_MS = 15 * 60 * 1000; // 15 minutes
-const weatherCard = $("#weather-card");
+
+function weatherUrl(loc) {
+  return "https://api.open-meteo.com/v1/forecast" +
+    "?latitude=" + loc.lat + "&longitude=" + loc.lon +
+    "&current=temperature_2m,weather_code,wind_speed_10m,relative_humidity_2m,apparent_temperature" +
+    "&daily=temperature_2m_max,temperature_2m_min,weather_code,precipitation_probability_max" +
+    "&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch" +
+    "&timezone=America/New_York&forecast_days=5";
+}
 
 // WMO weather code → { label, emoji }. Day icons; close enough at night.
 function wmo(code) {
@@ -728,33 +746,35 @@ function dayLabel(isoDate, idx) {
   return d.toLocaleDateString(undefined, { weekday: "short" });
 }
 
-async function loadWeather() {
+async function loadWeatherFor(loc) {
+  const card = document.getElementById("wx-" + loc.id);
+  if (!card) return;
   try {
-    const res = await fetch(WEATHER_URL, { cache: "no-store" });
+    const res = await fetch(weatherUrl(loc), { cache: "no-store" });
     if (!res.ok) throw new Error("HTTP " + res.status);
     const data = await res.json();
     const cur = data.current, day = data.daily;
     const [curLabel, curIcon] = wmo(cur.weather_code);
 
     const forecastHtml = day.time.map((iso, i) => {
-      const [, ic] = wmo(day.weather_code[i]);
+      const [label, ic] = wmo(day.weather_code[i]);
       const hi = Math.round(day.temperature_2m_max[i]);
       const lo = Math.round(day.temperature_2m_min[i]);
       const pop = day.precipitation_probability_max[i];
-      const popTxt = (pop != null && pop >= 20) ? ` · ${pop}%` : "";
+      const popTxt = (pop != null && pop >= 20) ? " · " + pop + "% precip" : "";
       return `
-        <div class="weather-day" title="${escapeHtml(wmo(day.weather_code[i])[0])}${popTxt ? ' · ' + pop + '% precip' : ''}">
+        <div class="weather-day" title="${escapeHtml(label + popTxt)}">
           <div class="d">${escapeHtml(dayLabel(iso, i))}</div>
           <div class="i">${ic}</div>
           <div class="t"><b>${hi}°</b> <span style="color:var(--muted)">${lo}°</span></div>
         </div>`;
     }).join("");
 
-    weatherCard.innerHTML = `
+    card.innerHTML = `
       <div class="weather-now">
         <div class="weather-icon">${curIcon}</div>
         <div>
-          <div class="weather-loc">Cortland, NY</div>
+          <div class="weather-loc">${escapeHtml(loc.name)}</div>
           <div style="display:flex;align-items:baseline;gap:10px;">
             <div class="weather-temp">${Math.round(cur.temperature_2m)}°F</div>
             <div class="weather-meta">${escapeHtml(curLabel)}</div>
@@ -770,13 +790,17 @@ async function loadWeather() {
       <div class="weather-forecast">${forecastHtml}</div>
     `;
   } catch (e) {
-    weatherCard.innerHTML =
-      `<div class="weather-error">Weather unavailable right now (${escapeHtml(e.message || "error")})</div>`;
+    card.innerHTML =
+      `<div class="weather-error">${escapeHtml(loc.name)} weather unavailable (${escapeHtml(e.message || "error")})</div>`;
   }
 }
 
-loadWeather();
-setInterval(loadWeather, WEATHER_REFRESH_MS);
+function loadAllWeather() {
+  LOCATIONS.forEach(loadWeatherFor);
+}
+
+loadAllWeather();
+setInterval(loadAllWeather, WEATHER_REFRESH_MS);
 </script>
 </body>
 </html>
