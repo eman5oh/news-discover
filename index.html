@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <meta name="theme-color" content="#0b0d10" />
-<title>Discover · Local · National · AI</title>
+<title>Discover · Local · National · AI &amp; Tech</title>
 <script>
   // Apply saved theme before first paint to avoid a flash of the wrong theme.
   try {
@@ -195,7 +195,7 @@
 <header>
   <div class="bar">
     <div class="logo">D</div>
-    <h1>Discover <span class="sub">Local · National · AI</span></h1>
+    <h1>Discover <span class="sub">Local · National · AI &amp; Tech</span></h1>
     <div class="grow"></div>
     <div class="meta">
       <span class="dot" id="status-dot" title="Live"></span>
@@ -221,9 +221,9 @@
     </div>
     <div class="list" data-list></div>
   </section>
-  <section class="col" id="col-ai">
+  <section class="col" id="col-tech">
     <div class="col-head">
-      <div class="col-title">AI News</div>
+      <div class="col-title">AI &amp; Tech</div>
       <div class="col-count" data-count></div>
     </div>
     <div class="list" data-list></div>
@@ -260,7 +260,8 @@ const FEEDS = {
     { name: "CBS News",           url: "https://www.cbsnews.com/latest/rss/main" },
     { name: "Reuters US",         url: "https://www.reutersagency.com/feed/?best-regions=north-america&post_type=best" },
   ],
-  ai: [
+  tech: [
+    // AI-focused
     { name: "TechCrunch AI",      url: "https://techcrunch.com/category/artificial-intelligence/feed/" },
     { name: "The Verge AI",       url: "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml" },
     { name: "Ars Technica AI",    url: "https://arstechnica.com/ai/feed/" },
@@ -268,6 +269,13 @@ const FEEDS = {
     { name: "VentureBeat AI",     url: "https://venturebeat.com/category/ai/feed/" },
     { name: "Anthropic News",     url: "https://www.anthropic.com/news/rss.xml" },
     { name: "OpenAI Blog",        url: "https://openai.com/blog/rss.xml" },
+    // General tech
+    { name: "TechCrunch",         url: "https://techcrunch.com/feed/" },
+    { name: "The Verge",          url: "https://www.theverge.com/rss/index.xml" },
+    { name: "Ars Technica",       url: "https://feeds.arstechnica.com/arstechnica/index" },
+    { name: "Wired",              url: "https://www.wired.com/feed/rss" },
+    { name: "Engadget",           url: "https://www.engadget.com/rss.xml" },
+    { name: "Hacker News",        url: "https://hnrss.org/frontpage" },
   ],
 };
 
@@ -596,7 +604,7 @@ async function loadAll(manual = false) {
   const results = await Promise.all([
     loadColumn("local"),
     loadColumn("national"),
-    loadColumn("ai"),
+    loadColumn("tech"),
   ]);
 
   lastLoadAt = Date.now();
