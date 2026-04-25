@@ -249,7 +249,16 @@ const FEEDS = {
 
 const PER_COLUMN_MAX = 18;
 const REFRESH_MS = 10 * 60 * 1000; // 10 minutes
-const PROXY = "https://api.allorigins.win/raw?url=";
+
+// CORS proxy fallback chain. Tried in order — first one that returns
+// usable XML wins. Several is intentional: any single public proxy goes
+// down or rate-limits eventually.
+const PROXIES = [
+  (url) => "https://api.cors.lol/?url=" + encodeURIComponent(url),
+  (url) => "https://api.allorigins.win/raw?url=" + encodeURIComponent(url),
+  (url) => "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(url),
+  (url) => "https://corsproxy.io/?url=" + encodeURIComponent(url),
+];
 
 // Sports filter — applied to every column. Matches a sports keyword in the
 // title/summary OR a /sports/-style segment in the article URL.
@@ -420,11 +429,26 @@ function parseFeed(xmlText, sourceName) {
 }
 
 async function fetchFeed(feed) {
-  const url = PROXY + encodeURIComponent(feed.url);
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error(feed.name + " HTTP " + res.status);
-  const text = await res.text();
-  return parseFeed(text, feed.name);
+  let lastErr = null;
+  for (const proxy of PROXIES) {
+    const url = proxy(feed.url);
+    try {
+      // Per-attempt timeout so a slow proxy can't stall the whole column.
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 12_000);
+      const res = await fetch(url, { cache: "no-store", signal: ac.signal });
+      clearTimeout(timer);
+      if (!res.ok) { lastErr = new Error("HTTP " + res.status); continue; }
+      const text = await res.text();
+      const items = parseFeed(text, feed.name);
+      if (items.length > 0) return items;
+      // Empty parse — try the next proxy in case this one returned an error page.
+      lastErr = new Error("empty / unparseable");
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw new Error(feed.name + ": " + (lastErr ? lastErr.message : "all proxies failed"));
 }
 
 async function loadColumn(category) {
