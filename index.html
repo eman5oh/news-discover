@@ -5,8 +5,16 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <meta name="theme-color" content="#0b0d10" />
 <title>Discover · Local · National · AI</title>
+<script>
+  // Apply saved theme before first paint to avoid a flash of the wrong theme.
+  try {
+    const t = localStorage.getItem("theme");
+    if (t === "dark" || t === "light") document.documentElement.dataset.theme = t;
+  } catch (_) {}
+</script>
 <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='12' fill='%231f6feb'/><text x='50%25' y='56%25' font-family='Inter,Arial,sans-serif' font-size='34' font-weight='800' text-anchor='middle' fill='white'>D</text></svg>" />
 <style>
+  /* Light is the default. */
   :root {
     --bg: #f7f7f8;
     --bg-card: #ffffff;
@@ -18,8 +26,9 @@
     --pill: #eef2f7;
     --shadow: 0 1px 2px rgba(16,24,40,.04), 0 1px 3px rgba(16,24,40,.06);
   }
+  /* Follow the OS when the user hasn't picked a theme. */
   @media (prefers-color-scheme: dark) {
-    :root {
+    :root:not([data-theme="light"]) {
       --bg: #0b0d10;
       --bg-card: #14171c;
       --bg-card-hover: #181c22;
@@ -30,6 +39,18 @@
       --pill: #1c2129;
       --shadow: none;
     }
+  }
+  /* Manual override — wins over OS preference. */
+  :root[data-theme="dark"] {
+    --bg: #0b0d10;
+    --bg-card: #14171c;
+    --bg-card-hover: #181c22;
+    --border: #232830;
+    --text: #e7e9ee;
+    --muted: #98a0ad;
+    --accent: #4c8dff;
+    --pill: #1c2129;
+    --shadow: none;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; }
@@ -65,14 +86,16 @@
     color: var(--muted); font-size: 12px;
     display: flex; align-items: center; gap: 10px;
   }
-  button.refresh {
+  button.refresh, button.theme {
     appearance: none; background: var(--bg-card); color: var(--text);
     border: 1px solid var(--border); border-radius: 999px;
     padding: 6px 12px; font-size: 13px; cursor: pointer;
     display: inline-flex; align-items: center; gap: 6px;
   }
-  button.refresh:hover { background: var(--bg-card-hover); }
-  button.refresh:active { transform: translateY(1px); }
+  button.refresh:hover, button.theme:hover { background: var(--bg-card-hover); }
+  button.refresh:active, button.theme:active { transform: translateY(1px); }
+  button.theme { padding: 6px 10px; font-size: 14px; line-height: 1; }
+  button.theme svg { width: 16px; height: 16px; display: block; }
   .dot {
     width: 8px; height: 8px; border-radius: 50%; background: #16a34a;
     box-shadow: 0 0 0 0 rgba(22,163,74,.6);
@@ -178,6 +201,7 @@
       <span class="dot" id="status-dot" title="Live"></span>
       <span id="status-text">Updating…</span>
     </div>
+    <button class="theme" id="theme-btn" title="Toggle dark mode" aria-label="Toggle dark mode"></button>
     <button class="refresh" id="refresh-btn" title="Refresh now">↻ Refresh</button>
   </div>
 </header>
@@ -292,8 +316,34 @@ const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const statusDot  = $("#status-dot");
 const statusText = $("#status-text");
 const refreshBtn = $("#refresh-btn");
+const themeBtn   = $("#theme-btn");
 
 refreshBtn.addEventListener("click", () => loadAll(true));
+
+/* ---- Dark / light toggle ---------------------------------------- */
+const SUN_ICON  = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>';
+const MOON_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+
+function effectiveTheme() {
+  const set = document.documentElement.dataset.theme;
+  if (set === "dark" || set === "light") return set;
+  return matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+function syncThemeButton() {
+  // Show the icon for what clicking the button will switch you TO.
+  themeBtn.innerHTML = effectiveTheme() === "dark" ? SUN_ICON : MOON_ICON;
+}
+themeBtn.addEventListener("click", () => {
+  const next = effectiveTheme() === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem("theme", next); } catch (_) {}
+  syncThemeButton();
+});
+// React if the OS theme changes and the user hasn't picked one.
+matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", () => {
+  if (!document.documentElement.dataset.theme) syncThemeButton();
+});
+syncThemeButton();
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden && (Date.now() - lastLoadAt) > 60_000) loadAll();
 });
