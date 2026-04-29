@@ -448,60 +448,111 @@ function stripHtml(html) {
   return (tmp.textContent || tmp.innerText || "").replace(/\s+/g, " ").trim();
 }
 
-// Pull the first usable image URL out of an RSS/Atom <item>/<entry>.
-// Tries Media RSS, enclosures, iTunes, then falls back to first <img> in
-// description / content:encoded / content. Returns "" if none.
+// Try to upgrade a small/thumbnail image URL to a higher-res version.
+// Conservative — falls back to the original if the pattern doesn't match.
+function upgradeImageUrl(u) {
+  if (!u) return u;
+  let r = u;
+  // WordPress thumbnail suffix: foo-300x200.jpg → foo.jpg (full size)
+  r = r.replace(/-(\d{2,4})x(\d{2,4})(\.(?:jpe?g|png|webp|gif))/i, "$3");
+  // ?w= / ?width= / ?h= / ?height= — bump small values
+  r = r.replace(/([?&](?:w|width))=(\d+)/gi, (m, p, n) =>
+    parseInt(n, 10) < 1200 ? p + "=1200" : m);
+  r = r.replace(/([?&](?:h|height))=(\d+)/gi, (m, p, n) =>
+    parseInt(n, 10) < 800 ? p + "=800" : m);
+  // ?resize=300,200 (and the URL-encoded comma variant)
+  r = r.replace(/([?&]resize)=(\d+)(?:%2C|,)(\d+)/gi, "$1=1200,800");
+  // Thumbor / Vox CDN style: /<W>x<H>/ in the path → bump if small
+  r = r.replace(/\/(\d{2,3})x(\d{2,3})\//, (m, w) =>
+    parseInt(w, 10) < 800 ? "/1200x800/" : m);
+  return r;
+}
+
+// Pull the best usable image URL out of an RSS/Atom <item>/<entry>.
+// Collects candidates from Media RSS, enclosures, iTunes, and inline <img>
+// tags, scores by known width, picks the largest, then upgrades the URL.
 function extractImage(it) {
-  const tryUrl = (u) => {
+  const candidates = []; // { url, w }
+
+  const norm = (u) => {
     if (!u) return "";
     u = u.trim();
     if (!u) return "";
     if (u.startsWith("//")) u = "https:" + u;
     if (!/^https?:\/\//i.test(u)) return "";
+    // Drop trackers / spacers / icons
+    if (/\b(?:spacer|pixel|1x1|blank|tracking|beacon|stat\.gif|emoji)\b/i.test(u)) return "";
     return u;
   };
 
-  // <media:content url="..."> / <media:thumbnail url="...">
-  const mediaNodes = [
-    ...it.getElementsByTagNameNS("*", "content"),
-    ...it.getElementsByTagNameNS("*", "thumbnail"),
-  ];
-  for (const n of mediaNodes) {
+  const guessWidth = (url, attrW) => {
+    if (attrW && /^\d+$/.test(attrW)) return parseInt(attrW, 10);
+    let m = url.match(/-(\d{2,4})x\d{2,4}\.(?:jpe?g|png|webp|gif)/i);
+    if (m) return parseInt(m[1], 10);
+    m = url.match(/[?&](?:w|width)=(\d+)/i);
+    if (m) return parseInt(m[1], 10);
+    m = url.match(/\/(\d{2,4})x\d{2,4}\//);
+    if (m) return parseInt(m[1], 10);
+    return 0; // unknown
+  };
+
+  const add = (rawUrl, attrW) => {
+    const u = norm(rawUrl);
+    if (!u) return;
+    candidates.push({ url: u, w: guessWidth(u, attrW) });
+  };
+
+  // <media:content url="..." width="..." type="image/...">
+  for (const n of it.getElementsByTagNameNS("*", "content")) {
     const t = (n.getAttribute("type") || "").toLowerCase();
     if (t && !t.startsWith("image/")) continue;
-    const u = tryUrl(n.getAttribute("url"));
-    if (u) return u;
+    add(n.getAttribute("url"), n.getAttribute("width"));
   }
-
-  // <enclosure url="..." type="image/...">
+  // <media:thumbnail url="..." width="...">
+  for (const n of it.getElementsByTagNameNS("*", "thumbnail")) {
+    add(n.getAttribute("url"), n.getAttribute("width"));
+  }
+  // <enclosure url="..." type="image/..." length="...">
   for (const n of it.querySelectorAll("enclosure")) {
     const t = (n.getAttribute("type") || "").toLowerCase();
-    if (t.startsWith("image/") || /\.(jpe?g|png|webp|gif)(\?|$)/i.test(n.getAttribute("url") || "")) {
-      const u = tryUrl(n.getAttribute("url"));
-      if (u) return u;
+    const u = n.getAttribute("url") || "";
+    if (t.startsWith("image/") || /\.(jpe?g|png|webp|gif)(\?|$)/i.test(u)) {
+      add(u, n.getAttribute("width"));
     }
   }
-
-  // <itunes:image href="...">
+  // <itunes:image href="..."> (rare in news feeds, but cheap to check)
   for (const n of it.getElementsByTagNameNS("*", "image")) {
-    const u = tryUrl(n.getAttribute("href") || n.getAttribute("url") || n.textContent);
-    if (u) return u;
+    add(n.getAttribute("href") || n.getAttribute("url") || n.textContent, null);
   }
-
-  // First <img> inside description / content:encoded / content / summary
+  // <img> tags inside description / content:encoded / content / summary
   const htmlBlobs = [
     it.querySelector("description")?.textContent,
     it.getElementsByTagNameNS("*", "encoded")[0]?.textContent,
     it.querySelector("content")?.textContent,
     it.querySelector("summary")?.textContent,
   ].filter(Boolean);
+  const imgTagRe = /<img\b[^>]*>/gi;
   for (const html of htmlBlobs) {
-    const m = html.match(/<img[^>]+src=["']([^"']+)["']/i);
-    const u = tryUrl(m && m[1]);
-    if (u) return u;
+    const tags = html.match(imgTagRe) || [];
+    for (const tag of tags) {
+      const srcM = tag.match(/\bsrc=["']([^"']+)["']/i);
+      if (!srcM) continue;
+      const wM = tag.match(/\bwidth=["']?(\d+)/i);
+      add(srcM[1], wM ? wM[1] : null);
+    }
   }
 
-  return "";
+  if (candidates.length === 0) return "";
+
+  // Sort: largest known width first; unknown widths come after known widths
+  // ≥ 400, but before known small ones.
+  candidates.sort((a, b) => {
+    const sa = a.w || 250; // unknown ≈ "probably medium"
+    const sb = b.w || 250;
+    return sb - sa;
+  });
+
+  return upgradeImageUrl(candidates[0].url);
 }
 
 function parseFeed(xmlText, sourceName) {
@@ -647,7 +698,7 @@ function cardHtml(it) {
   // If the image fails to load, hide it so the card stays clean.
   const img = it.image
     ? `<img class="thumb" src="${escapeHtml(it.image)}" alt="" loading="lazy"
-            referrerpolicy="no-referrer"
+            decoding="async" referrerpolicy="no-referrer"
             onerror="this.remove()">`
     : "";
   return `
