@@ -4,6 +4,13 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <meta name="theme-color" content="#0b0d10" />
+<!-- Warm up TLS to the hosts we'll hit immediately, so the first fetches
+     don't pay for DNS + handshake serially. -->
+<link rel="preconnect" href="https://api.cors.lol" crossorigin>
+<link rel="preconnect" href="https://api.allorigins.win" crossorigin>
+<link rel="preconnect" href="https://api.open-meteo.com" crossorigin>
+<link rel="dns-prefetch" href="https://api.codetabs.com">
+<link rel="dns-prefetch" href="https://corsproxy.io">
 <title>Discover · Local · National · AI &amp; Tech</title>
 <script>
   // Apply saved theme before first paint to avoid a flash of the wrong theme.
@@ -348,6 +355,28 @@ const FEEDS = {
 
 const PER_COLUMN_MAX = 18;
 const REFRESH_MS = 10 * 60 * 1000; // 10 minutes
+const CACHE_VERSION = 1;
+const CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours — older than that, skip cache
+
+// Tiny localStorage helpers. Failures are silent (private mode, full quota,
+// etc.) — caching is best-effort.
+function cacheGet(key) {
+  try {
+    const raw = localStorage.getItem("news:v" + CACHE_VERSION + ":" + key);
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    if (!obj || (Date.now() - obj.ts) > CACHE_MAX_AGE_MS) return null;
+    return obj;
+  } catch (_) { return null; }
+}
+function cacheSet(key, payload) {
+  try {
+    localStorage.setItem(
+      "news:v" + CACHE_VERSION + ":" + key,
+      JSON.stringify({ ts: Date.now(), data: payload })
+    );
+  } catch (_) {}
+}
 
 // CORS proxy fallback chain. Tried in order — first one that returns
 // usable XML wins. Several is intentional: any single public proxy goes
@@ -604,35 +633,78 @@ function parseFeed(xmlText, sourceName) {
   return items;
 }
 
+// Single proxy attempt with its own abort.
+function fetchViaProxy(proxyFn, feed, timeoutMs) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  return fetch(proxyFn(feed.url), { cache: "no-store", signal: ac.signal })
+    .then(r => {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.text();
+    })
+    .then(t => {
+      const items = parseFeed(t, feed.name);
+      if (items.length === 0) throw new Error("empty");
+      return items;
+    })
+    .finally(() => clearTimeout(timer));
+}
+
+// Hedge the primary proxy: kick off proxy[0] immediately, and if it
+// hasn't replied in 1.5s, race proxy[1] alongside it. First success
+// wins. If both fail, fall back to the rest of the chain serially.
+// 8s per-attempt timeout keeps slow failures from stalling the page.
 async function fetchFeed(feed) {
-  let lastErr = null;
-  for (const proxy of PROXIES) {
-    const url = proxy(feed.url);
-    try {
-      // Per-attempt timeout so a slow proxy can't stall the whole column.
-      const ac = new AbortController();
-      const timer = setTimeout(() => ac.abort(), 12_000);
-      const res = await fetch(url, { cache: "no-store", signal: ac.signal });
-      clearTimeout(timer);
-      if (!res.ok) { lastErr = new Error("HTTP " + res.status); continue; }
-      const text = await res.text();
-      const items = parseFeed(text, feed.name);
-      if (items.length > 0) return items;
-      // Empty parse — try the next proxy in case this one returned an error page.
-      lastErr = new Error("empty / unparseable");
-    } catch (e) {
-      lastErr = e;
+  const HEDGE_DELAY_MS = 1500;
+  const TIMEOUT_MS = 8000;
+
+  const primary = fetchViaProxy(PROXIES[0], feed, TIMEOUT_MS);
+  const hedged = new Promise((resolve, reject) => {
+    setTimeout(() => {
+      fetchViaProxy(PROXIES[1], feed, TIMEOUT_MS).then(resolve, reject);
+    }, HEDGE_DELAY_MS);
+  });
+
+  try {
+    return await Promise.any([primary, hedged]);
+  } catch (_) {
+    let lastErr = null;
+    for (const proxy of PROXIES.slice(2)) {
+      try { return await fetchViaProxy(proxy, feed, TIMEOUT_MS); }
+      catch (e) { lastErr = e; }
+    }
+    throw new Error(feed.name + ": " + (lastErr ? lastErr.message : "all proxies failed"));
+  }
+}
+
+function renderColumnItems(category, items) {
+  const col = document.getElementById("col-" + category);
+  const list = col.querySelector("[data-list]");
+  const countEl = col.querySelector("[data-count]");
+  countEl.textContent = items.length ? items.length + " stories" : "No items";
+  list.innerHTML = items.length
+    ? items.map(cardHtml).join("")
+    : '<div class="empty">No headlines loaded right now. Try refreshing in a minute.</div>';
+  list.dataset.loadedOnce = "1";
+}
+
+// Paint cached items immediately on first paint so the page is usable
+// before any network request resolves. The live fetch will replace this
+// when fresh data arrives.
+function paintCachedColumns() {
+  for (const cat of ["local", "national", "tech"]) {
+    const cached = cacheGet("col:" + cat);
+    if (cached && Array.isArray(cached.data) && cached.data.length) {
+      renderColumnItems(cat, cached.data);
     }
   }
-  throw new Error(feed.name + ": " + (lastErr ? lastErr.message : "all proxies failed"));
 }
 
 async function loadColumn(category) {
   const col = document.getElementById("col-" + category);
   const list = col.querySelector("[data-list]");
-  const countEl = col.querySelector("[data-count]");
 
-  // Show skeletons on first load
+  // Skeletons only when we have nothing on screen yet (no cache, no prior load).
   if (!list.dataset.loadedOnce) {
     list.innerHTML = Array.from({ length: 5 })
       .map(() => '<div class="skeleton"></div>').join("");
@@ -666,25 +738,19 @@ async function loadColumn(category) {
   }
 
   const top = unique.slice(0, PER_COLUMN_MAX);
-  countEl.textContent = top.length
-    ? top.length + " stories"
-    : "No items";
+  renderColumnItems(category, top);
 
-  if (top.length === 0) {
-    list.innerHTML =
-      '<div class="empty">No headlines loaded right now. Try refreshing in a minute.</div>';
-  } else {
-    list.innerHTML = top.map(cardHtml).join("");
-  }
+  // Persist the rendered items so the next page load is instant.
+  if (top.length) cacheSet("col:" + category, top);
 
   if (failedSources.length) {
+    const list2 = document.querySelector("#col-" + category + " [data-list]");
     const note = document.createElement("div");
     note.className = "errbox";
     note.textContent = "Couldn't reach: " + failedSources.join(", ");
-    list.appendChild(note);
+    list2.appendChild(note);
   }
 
-  list.dataset.loadedOnce = "1";
   return { ok: results.some(r => r.status === "fulfilled"), failed: failedSources.length };
 }
 
@@ -737,6 +803,8 @@ async function loadAll(manual = false) {
   else                setStatus("ok",    "Live · updated " + stamp);
 }
 
+// Paint anything we cached last time before kicking off the network fetch.
+paintCachedColumns();
 loadAll();
 setInterval(loadAll, REFRESH_MS);
 
@@ -797,6 +865,57 @@ function dayLabel(isoDate, idx) {
   return d.toLocaleDateString(undefined, { weekday: "short" });
 }
 
+function renderWeather(loc, data) {
+  const card = document.getElementById("wx-" + loc.id);
+  if (!card) return;
+  const cur = data.current, day = data.daily;
+  const [curLabel, curIcon] = wmo(cur.weather_code);
+
+  const forecastHtml = day.time.map((iso, i) => {
+    const [label, ic] = wmo(day.weather_code[i]);
+    const hi = Math.round(day.temperature_2m_max[i]);
+    const lo = Math.round(day.temperature_2m_min[i]);
+    const pop = day.precipitation_probability_max[i];
+    const popTxt = (pop != null && pop >= 20) ? " · " + pop + "% precip" : "";
+    return `
+      <div class="weather-day" title="${escapeHtml(label + popTxt)}">
+        <div class="d">${escapeHtml(dayLabel(iso, i))}</div>
+        <div class="i">${ic}</div>
+        <div class="t"><b>${hi}°</b> <span style="color:var(--muted)">${lo}°</span></div>
+      </div>`;
+  }).join("");
+
+  card.innerHTML = `
+    <div class="weather-now">
+      <div class="weather-icon">${curIcon}</div>
+      <div>
+        <div class="weather-loc">${escapeHtml(loc.name)}</div>
+        <div style="display:flex;align-items:baseline;gap:10px;">
+          <div class="weather-temp">${Math.round(cur.temperature_2m)}°F</div>
+          <div class="weather-meta">${escapeHtml(curLabel)}</div>
+        </div>
+        <div class="weather-meta">
+          Feels <b>${Math.round(cur.apparent_temperature)}°</b> ·
+          Wind <b>${Math.round(cur.wind_speed_10m)} mph</b> ·
+          Humidity <b>${cur.relative_humidity_2m}%</b>
+        </div>
+      </div>
+    </div>
+    <div class="weather-divider"></div>
+    <div class="weather-forecast">${forecastHtml}</div>
+  `;
+}
+
+// Paint cached weather (≤ 1 hr old) on first load, before the network call.
+function paintCachedWeather() {
+  for (const loc of LOCATIONS) {
+    const cached = cacheGet("wx:" + loc.id);
+    if (cached && cached.data && (Date.now() - cached.ts) < 60 * 60 * 1000) {
+      renderWeather(loc, cached.data);
+    }
+  }
+}
+
 async function loadWeatherFor(loc) {
   const card = document.getElementById("wx-" + loc.id);
   if (!card) return;
@@ -804,42 +923,8 @@ async function loadWeatherFor(loc) {
     const res = await fetch(weatherUrl(loc), { cache: "no-store" });
     if (!res.ok) throw new Error("HTTP " + res.status);
     const data = await res.json();
-    const cur = data.current, day = data.daily;
-    const [curLabel, curIcon] = wmo(cur.weather_code);
-
-    const forecastHtml = day.time.map((iso, i) => {
-      const [label, ic] = wmo(day.weather_code[i]);
-      const hi = Math.round(day.temperature_2m_max[i]);
-      const lo = Math.round(day.temperature_2m_min[i]);
-      const pop = day.precipitation_probability_max[i];
-      const popTxt = (pop != null && pop >= 20) ? " · " + pop + "% precip" : "";
-      return `
-        <div class="weather-day" title="${escapeHtml(label + popTxt)}">
-          <div class="d">${escapeHtml(dayLabel(iso, i))}</div>
-          <div class="i">${ic}</div>
-          <div class="t"><b>${hi}°</b> <span style="color:var(--muted)">${lo}°</span></div>
-        </div>`;
-    }).join("");
-
-    card.innerHTML = `
-      <div class="weather-now">
-        <div class="weather-icon">${curIcon}</div>
-        <div>
-          <div class="weather-loc">${escapeHtml(loc.name)}</div>
-          <div style="display:flex;align-items:baseline;gap:10px;">
-            <div class="weather-temp">${Math.round(cur.temperature_2m)}°F</div>
-            <div class="weather-meta">${escapeHtml(curLabel)}</div>
-          </div>
-          <div class="weather-meta">
-            Feels <b>${Math.round(cur.apparent_temperature)}°</b> ·
-            Wind <b>${Math.round(cur.wind_speed_10m)} mph</b> ·
-            Humidity <b>${cur.relative_humidity_2m}%</b>
-          </div>
-        </div>
-      </div>
-      <div class="weather-divider"></div>
-      <div class="weather-forecast">${forecastHtml}</div>
-    `;
+    cacheSet("wx:" + loc.id, data);
+    renderWeather(loc, data);
   } catch (e) {
     card.innerHTML =
       `<div class="weather-error">${escapeHtml(loc.name)} weather unavailable (${escapeHtml(e.message || "error")})</div>`;
@@ -850,6 +935,7 @@ function loadAllWeather() {
   LOCATIONS.forEach(loadWeatherFor);
 }
 
+paintCachedWeather();
 loadAllWeather();
 setInterval(loadAllWeather, WEATHER_REFRESH_MS);
 </script>
