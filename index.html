@@ -317,45 +317,49 @@
 
 const FEEDS = {
   local: [
-    // Cortland (13045)
-    { name: "Cortland Standard",  url: "https://www.cortlandstandard.com/feed/" },
+    // Cortland (13045) — free sources only
     { name: "Cortland Voice",     url: "https://www.cortlandvoice.com/feed/" },
-    // Ithaca (14850)
-    { name: "Ithaca Journal",     url: "https://rssfeeds.ithacajournal.com/ithaca/news" },
-    { name: "Ithaca Times",       url: "https://www.ithaca.com/search/?f=rss&t=article&l=25&s=start_time&sd=desc" },
+    { name: "WSYR Syracuse",      url: "https://www.localsyr.com/feed/" },
+    { name: "Syracuse.com",       url: "https://www.syracuse.com/arc/outboundfeeds/rss/?outputType=xml" },
+    // Ithaca (14850) — free sources only
     { name: "Ithaca Voice",       url: "https://ithacavoice.org/feed/" },
+    { name: "Ithaca Times",       url: "https://www.ithaca.com/search/?f=rss&t=article&l=25&s=start_time&sd=desc" },
+    { name: "Cornell Daily Sun",  url: "https://cornellsun.com/feed/" },
+    { name: "Tompkins Weekly",    url: "https://tompkinsweekly.com/feed/" },
   ],
   national: [
     { name: "NPR News",           url: "https://feeds.npr.org/1001/rss.xml" },
     { name: "AP Top News",        url: "https://feeds.apnews.com/rss/apf-topnews" },
-    { name: "NYT Home",           url: "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml" },
     { name: "BBC US & Canada",    url: "https://feeds.bbci.co.uk/news/world/us_and_canada/rss.xml" },
     { name: "PBS NewsHour",       url: "https://www.pbs.org/newshour/feeds/rss/headlines" },
     { name: "CBS News",           url: "https://www.cbsnews.com/latest/rss/main" },
-    { name: "Reuters US",         url: "https://www.reutersagency.com/feed/?best-regions=north-america&post_type=best" },
+    { name: "ABC News",           url: "https://abcnews.go.com/abcnews/topstories" },
+    { name: "The Guardian US",    url: "https://www.theguardian.com/us-news/rss" },
+    { name: "Reuters",            url: "https://www.reutersagency.com/feed/?best-regions=north-america&post_type=best" },
   ],
   tech: [
-    // AI-focused
+    // AI-focused — free sources only
     { name: "TechCrunch AI",      url: "https://techcrunch.com/category/artificial-intelligence/feed/" },
-    { name: "The Verge AI",       url: "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml" },
     { name: "Ars Technica AI",    url: "https://arstechnica.com/ai/feed/" },
-    { name: "MIT Tech Review AI", url: "https://www.technologyreview.com/topic/artificial-intelligence/feed" },
     { name: "VentureBeat AI",     url: "https://venturebeat.com/category/ai/feed/" },
     { name: "Anthropic News",     url: "https://www.anthropic.com/news/rss.xml" },
     { name: "OpenAI Blog",        url: "https://openai.com/blog/rss.xml" },
-    // General tech
+    { name: "Google AI",          url: "https://blog.google/technology/ai/rss/" },
+    { name: "Simon Willison",     url: "https://simonwillison.net/atom/everything/" },
+    // General tech — free sources only
     { name: "TechCrunch",         url: "https://techcrunch.com/feed/" },
-    { name: "The Verge",          url: "https://www.theverge.com/rss/index.xml" },
     { name: "Ars Technica",       url: "https://feeds.arstechnica.com/arstechnica/index" },
-    { name: "Wired",              url: "https://www.wired.com/feed/rss" },
     { name: "Engadget",           url: "https://www.engadget.com/rss.xml" },
+    { name: "The Register",       url: "https://www.theregister.com/headlines.atom" },
+    { name: "9to5Mac",            url: "https://9to5mac.com/feed/" },
+    { name: "404 Media",          url: "https://www.404media.co/rss/" },
     { name: "Hacker News",        url: "https://hnrss.org/frontpage" },
   ],
 };
 
 const PER_COLUMN_MAX = 18;
 const REFRESH_MS = 10 * 60 * 1000; // 10 minutes
-const CACHE_VERSION = 1;
+const CACHE_VERSION = 2;
 const CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours — older than that, skip cache
 
 // Tiny localStorage helpers. Failures are silent (private mode, full quota,
