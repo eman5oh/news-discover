@@ -13,9 +13,26 @@
 <link rel="dns-prefetch" href="https://corsproxy.io">
 <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
 <link rel="preconnect" href="https://calendar.google.com" crossorigin>
+<link rel="preconnect" href="https://unpkg.com" crossorigin>
 <!-- ical.js parses RFC 5545 calendars including recurrence (RRULE/EXDATE).
-     Loaded with defer so it's ready before DOMContentLoaded. -->
-<script defer src="https://cdn.jsdelivr.net/npm/ical.js@2.0.1/build/ical.min.js"></script>
+     Load from jsdelivr with a fallback to unpkg if it 404s or is blocked. -->
+<script>
+  (function () {
+    const cdns = [
+      "https://cdn.jsdelivr.net/npm/ical.js@2/dist/ical.min.js",
+      "https://unpkg.com/ical.js@2/dist/ical.min.js",
+    ];
+    let i = 0;
+    (function load() {
+      if (i >= cdns.length) { window.__icalLoadFailed = true; return; }
+      const s = document.createElement("script");
+      s.src = cdns[i++];
+      s.async = false; // preserve execution order vs anything appended later
+      s.onerror = load;
+      document.head.appendChild(s);
+    })();
+  })();
+</script>
 <title>Discover · Local · National · AI &amp; Tech</title>
 <script>
   // Apply saved theme before first paint to avoid a flash of the wrong theme.
@@ -1148,6 +1165,21 @@ async function fetchIcs(url) {
   throw new Error("Tried: " + attempts.join(" · "));
 }
 
+// Poll for ical.js to finish loading. Resolves once `ICAL` is defined,
+// or rejects after ~10s of waiting (or if the loader marked failure).
+function waitForIcal() {
+  return new Promise((resolve, reject) => {
+    if (typeof ICAL !== "undefined") return resolve();
+    if (window.__icalLoadFailed) return reject(new Error("ical.js failed to load (CDN unreachable — ad blocker?)"));
+    let waited = 0;
+    const i = setInterval(() => {
+      if (typeof ICAL !== "undefined") { clearInterval(i); resolve(); return; }
+      if (window.__icalLoadFailed) { clearInterval(i); reject(new Error("ical.js failed to load (CDN unreachable — ad blocker?)")); return; }
+      if ((waited += 100) > 10_000) { clearInterval(i); reject(new Error("ical.js load timed out")); }
+    }, 100);
+  });
+}
+
 // Parse the VCALENDAR string and return events overlapping today (local TZ),
 // including recurring events expanded via ical.js.
 function eventsForToday(icsText) {
@@ -1282,6 +1314,10 @@ function renderCalError(msg) {
 async function loadCalendar(force) {
   const url = getCalUrl();
   if (!url) { renderCalSetup(); return; }
+
+  // Make sure ical.js is actually loaded before we try to use it.
+  try { await waitForIcal(); }
+  catch (e) { renderCalError(e.message); return; }
 
   // Paint cached ICS immediately if we have a recent copy.
   if (!force) {
