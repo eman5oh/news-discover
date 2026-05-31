@@ -15,12 +15,16 @@
 <link rel="preconnect" href="https://calendar.google.com" crossorigin>
 <link rel="preconnect" href="https://unpkg.com" crossorigin>
 <!-- ical.js parses RFC 5545 calendars including recurrence (RRULE/EXDATE).
-     Load from jsdelivr with a fallback to unpkg if it 404s or is blocked. -->
+     Pin to v1.5.0 because v2 is shipped as an ES module — its dist file
+     uses `export` and does NOT expose ICAL as a global when loaded via
+     a regular <script>, so typeof ICAL would never become defined.
+     v1.5.0 has the same API and exposes window.ICAL via UMD. Try
+     jsdelivr first, fall back to unpkg if it's unreachable. -->
 <script>
   (function () {
     const cdns = [
-      "https://cdn.jsdelivr.net/npm/ical.js@2/dist/ical.min.js",
-      "https://unpkg.com/ical.js@2/dist/ical.min.js",
+      "https://cdn.jsdelivr.net/npm/ical.js@1.5.0/build/ical.min.js",
+      "https://unpkg.com/ical.js@1.5.0/build/ical.min.js",
     ];
     let i = 0;
     (function load() {
