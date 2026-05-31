@@ -1109,6 +1109,20 @@ async function fetchIcs(url) {
     { name: "corsproxy.io", fn: (u) => "https://corsproxy.io/?url=" + encodeURIComponent(u) },
   ];
 
+  // Recognise an ICS file via any of its required markers. Some proxies
+  // wrap responses in HTML — try to extract the inner text in that case.
+  const looksLikeIcs = (s) => /BEGIN:VCALENDAR|^PRODID:|BEGIN:VEVENT/im.test(s.slice(0, 8000));
+  const unwrapIfHtml = (s) => {
+    if (!/^\s*</.test(s)) return s;
+    // Strip tags & decode the common entities. ICS markers are plain ASCII
+    // so we only need this rough cleanup to find them.
+    const stripped = s.replace(/<[^>]+>/g, " ")
+                       .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+                       .replace(/&amp;/g, "&").replace(/&quot;/g, '"')
+                       .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n));
+    return looksLikeIcs(stripped) ? stripped : s;
+  };
+
   const attempts = [];
   for (const p of ICS_PROXIES) {
     try {
@@ -1122,8 +1136,11 @@ async function fetchIcs(url) {
       if (p.name === "allorigins-g") {
         try { t = JSON.parse(t).contents || ""; } catch (_) { t = ""; }
       }
-      if (t && t.includes("BEGIN:VCALENDAR")) return t;
-      attempts.push(p.name + " (not ICS, " + t.length + " bytes)");
+      const candidate = unwrapIfHtml(t);
+      if (looksLikeIcs(candidate)) return candidate;
+      const head = t.slice(0, 80).replace(/\s+/g, " ").trim();
+      const tag = /^\s*</.test(t) ? "HTML" : "not ICS";
+      attempts.push(p.name + ' (' + tag + ', ' + t.length + 'b, "' + head + '")');
     } catch (e) {
       attempts.push(p.name + " " + (e.name === "AbortError" ? "timeout" : (e.message || "error")));
     }
