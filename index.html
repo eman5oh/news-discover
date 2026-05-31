@@ -1091,23 +1091,44 @@ async function fetchIcs(url) {
   // first (fast path), then fall back to the proxy chain.
   try {
     const r = await fetch(url, { cache: "no-store" });
-    if (r.ok) return await r.text();
+    if (r.ok) {
+      const t = await r.text();
+      if (t.includes("BEGIN:VCALENDAR")) return t;
+    }
   } catch (_) { /* CORS or network — try proxies */ }
 
-  let lastErr = null;
-  for (const proxy of PROXIES) {
+  // ICS-specific proxy order. codetabs leads because it accepts longer
+  // URLs and bigger response bodies than cors.lol (which returns 413 for
+  // Google iCal URLs above a fairly short threshold). AllOrigins second
+  // for breadth, then the rest as fallbacks.
+  const ICS_PROXIES = [
+    { name: "codetabs",     fn: (u) => "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(u) },
+    { name: "allorigins",   fn: (u) => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u) },
+    { name: "allorigins-g", fn: (u) => "https://api.allorigins.win/get?url=" + encodeURIComponent(u) + "&disableCache=true" },
+    { name: "cors.lol",     fn: (u) => "https://api.cors.lol/?url=" + encodeURIComponent(u) },
+    { name: "corsproxy.io", fn: (u) => "https://corsproxy.io/?url=" + encodeURIComponent(u) },
+  ];
+
+  const attempts = [];
+  for (const p of ICS_PROXIES) {
     try {
       const ac = new AbortController();
-      const timer = setTimeout(() => ac.abort(), 10_000);
-      const r = await fetch(proxy(url), { cache: "no-store", signal: ac.signal });
+      const timer = setTimeout(() => ac.abort(), 12_000);
+      const r = await fetch(p.fn(url), { cache: "no-store", signal: ac.signal });
       clearTimeout(timer);
-      if (!r.ok) { lastErr = new Error("HTTP " + r.status); continue; }
-      const t = await r.text();
+      if (!r.ok) { attempts.push(p.name + " " + r.status); continue; }
+      let t = await r.text();
+      // allorigins /get wraps the body in JSON
+      if (p.name === "allorigins-g") {
+        try { t = JSON.parse(t).contents || ""; } catch (_) { t = ""; }
+      }
       if (t && t.includes("BEGIN:VCALENDAR")) return t;
-      lastErr = new Error("not an ICS file");
-    } catch (e) { lastErr = e; }
+      attempts.push(p.name + " (not ICS, " + t.length + " bytes)");
+    } catch (e) {
+      attempts.push(p.name + " " + (e.name === "AbortError" ? "timeout" : (e.message || "error")));
+    }
   }
-  throw new Error(lastErr ? lastErr.message : "all proxies failed");
+  throw new Error("Tried: " + attempts.join(" · "));
 }
 
 // Parse the VCALENDAR string and return events overlapping today (local TZ),
@@ -1227,7 +1248,13 @@ function renderCalError(msg) {
         <button id="cal-disconnect">Change</button>
       </div>
     </div>
-    <div class="cal-empty">Couldn't load your calendar: ${escapeHtml(msg)}</div>`;
+    <div class="cal-empty">Couldn't load your calendar.</div>
+    <details style="margin-top:8px;">
+      <summary style="cursor:pointer;color:var(--muted);font-size:12px;">Show details</summary>
+      <div style="margin-top:6px;color:var(--muted);font-size:12px;font-family:ui-monospace,Menlo,Consolas,monospace;word-break:break-all;">
+        ${escapeHtml(msg)}
+      </div>
+    </details>`;
   $("#cal-retry").addEventListener("click", () => loadCalendar(true));
   $("#cal-disconnect").addEventListener("click", () => {
     setCalUrl(""); try { localStorage.removeItem(CAL_CACHE_KEY); } catch (_) {}
