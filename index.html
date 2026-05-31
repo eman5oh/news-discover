@@ -11,6 +11,11 @@
 <link rel="preconnect" href="https://api.open-meteo.com" crossorigin>
 <link rel="dns-prefetch" href="https://api.codetabs.com">
 <link rel="dns-prefetch" href="https://corsproxy.io">
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+<link rel="preconnect" href="https://calendar.google.com" crossorigin>
+<!-- ical.js parses RFC 5545 calendars including recurrence (RRULE/EXDATE).
+     Loaded with defer so it's ready before DOMContentLoaded. -->
+<script defer src="https://cdn.jsdelivr.net/npm/ical.js@2.0.1/build/ical.min.js"></script>
 <title>Discover · Local · National · AI &amp; Tech</title>
 <script>
   // Apply saved theme before first paint to avoid a flash of the wrong theme.
@@ -246,6 +251,75 @@
   .weather-day .t { font-size: 12.5px; }
   .weather-day .t b { font-weight: 650; }
   .weather-error { color: var(--muted); font-size: 13px; }
+
+  /* ---- Calendar (Today at a glance) ---- */
+  .cal {
+    max-width: 1400px; margin: 14px auto 0; padding: 0 16px;
+  }
+  .cal-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    box-shadow: var(--shadow);
+    padding: 14px 18px;
+  }
+  .cal-head {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 12px; margin-bottom: 10px;
+  }
+  .cal-title { font-size: 15px; font-weight: 700; letter-spacing: -0.005em; }
+  .cal-title .date { color: var(--muted); font-weight: 500; margin-left: 6px; }
+  .cal-actions { display: flex; align-items: center; gap: 8px; }
+  .cal-actions button {
+    appearance: none; background: transparent; color: var(--muted);
+    border: none; padding: 4px 8px; font-size: 12px; cursor: pointer;
+    border-radius: 6px;
+  }
+  .cal-actions button:hover { background: var(--pill); color: var(--text); }
+  .cal-events { display: flex; flex-direction: column; gap: 6px; }
+  .cal-event {
+    display: grid; grid-template-columns: 110px 1fr; gap: 14px;
+    padding: 8px 10px; border-radius: 10px; align-items: baseline;
+  }
+  .cal-event:hover { background: var(--bg-card-hover); }
+  .cal-event.now { background: color-mix(in oklab, var(--accent) 10%, transparent); }
+  .cal-event.now .cal-time { color: var(--accent); font-weight: 700; }
+  .cal-time {
+    font-variant-numeric: tabular-nums;
+    font-size: 13px; color: var(--muted); font-weight: 600;
+    white-space: nowrap;
+  }
+  .cal-event-title { font-size: 14.5px; font-weight: 600; }
+  .cal-empty { color: var(--muted); font-size: 13.5px; padding: 6px 4px; }
+
+  /* Setup state */
+  .cal-setup { padding: 4px 0; }
+  .cal-setup h3 { margin: 0 0 6px; font-size: 15px; font-weight: 700; }
+  .cal-setup p { margin: 0 0 10px; color: var(--muted); font-size: 13px; line-height: 1.5; }
+  .cal-setup p a { color: var(--accent); }
+  .cal-setup-form {
+    display: flex; gap: 8px; flex-wrap: wrap;
+  }
+  .cal-setup-form input {
+    flex: 1 1 320px; min-width: 0;
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 12px; font-size: 13px; font-family: inherit;
+  }
+  .cal-setup-form input:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+  .cal-setup-form button {
+    appearance: none; background: var(--accent); color: white;
+    border: none; border-radius: 8px; padding: 8px 16px;
+    font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  .cal-setup-form button:hover { filter: brightness(1.05); }
+  .cal-setup-form button:disabled { opacity: 0.5; cursor: default; }
+  .cal-setup details { margin-top: 10px; }
+  .cal-setup summary {
+    cursor: pointer; color: var(--muted); font-size: 12.5px;
+    user-select: none;
+  }
+  .cal-setup details ol { margin: 8px 0 0; padding-left: 22px; color: var(--muted); font-size: 12.5px; line-height: 1.6; }
   @media (max-width: 720px) {
     .weather-card { padding: 12px 14px; gap: 12px; }
     .weather-divider { display: none; }
@@ -277,6 +351,12 @@
     <div class="weather-card" id="wx-ithaca">
       <div class="weather-error">Loading Ithaca weather…</div>
     </div>
+  </div>
+</div>
+
+<div class="cal">
+  <div class="cal-card" id="cal-card">
+    <div class="cal-empty">Loading calendar…</div>
   </div>
 </div>
 
@@ -942,6 +1022,249 @@ function loadAllWeather() {
 paintCachedWeather();
 loadAllWeather();
 setInterval(loadAllWeather, WEATHER_REFRESH_MS);
+
+/* ---- Calendar: "Today at a glance" (Google iCal, no OAuth) ----- */
+const CAL_URL_KEY     = "cal:v1:url";
+const CAL_CACHE_KEY   = "cal:v1:ics";
+const CAL_REFRESH_MS  = 5 * 60 * 1000;   // 5 minutes
+const CAL_CACHE_TTL_MS = 30 * 60 * 1000; // accept cached ICS up to 30 min old
+const calCard = $("#cal-card");
+
+function getCalUrl() {
+  try { return (localStorage.getItem(CAL_URL_KEY) || "").trim(); } catch (_) { return ""; }
+}
+function setCalUrl(u) {
+  try {
+    if (u) localStorage.setItem(CAL_URL_KEY, u);
+    else   localStorage.removeItem(CAL_URL_KEY);
+  } catch (_) {}
+}
+function normalizeCalUrl(u) {
+  u = (u || "").trim();
+  if (u.startsWith("webcal://")) u = "https://" + u.slice(9);
+  return u;
+}
+
+function renderCalSetup(prefill) {
+  calCard.innerHTML = `
+    <div class="cal-setup">
+      <h3>Connect your Google Calendar</h3>
+      <p>Paste your <b>Secret address in iCal format</b> below. It's stored only in this browser — not in the repo or on any server.</p>
+      <div class="cal-setup-form">
+        <input id="cal-input" type="url" placeholder="https://calendar.google.com/calendar/ical/…/basic.ics"
+               value="${escapeHtml(prefill || "")}" autocomplete="off" spellcheck="false">
+        <button id="cal-save">Connect</button>
+      </div>
+      <details>
+        <summary>How do I find this URL?</summary>
+        <ol>
+          <li>Open <a href="https://calendar.google.com" target="_blank" rel="noopener">Google Calendar</a> in a browser.</li>
+          <li>Click the gear (top right) → <b>Settings</b>.</li>
+          <li>In the left sidebar, under <b>Settings for my calendars</b>, click your calendar.</li>
+          <li>Scroll down to <b>Integrate calendar</b>.</li>
+          <li>Copy <b>Secret address in iCal format</b> (not "Public address").</li>
+          <li>Paste it above and click <b>Connect</b>.</li>
+        </ol>
+      </details>
+    </div>`;
+  $("#cal-save").addEventListener("click", saveCalFromInput);
+  $("#cal-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") saveCalFromInput();
+  });
+}
+
+function saveCalFromInput() {
+  const raw = $("#cal-input").value;
+  const u = normalizeCalUrl(raw);
+  if (!/^https?:\/\//i.test(u)) {
+    alert("That doesn't look like a calendar URL. It should start with https:// or webcal://");
+    return;
+  }
+  setCalUrl(u);
+  try { localStorage.removeItem(CAL_CACHE_KEY); } catch (_) {}
+  calCard.innerHTML = '<div class="cal-empty">Loading calendar…</div>';
+  loadCalendar();
+}
+
+async function fetchIcs(url) {
+  // Google's iCal endpoint sometimes serves CORS, sometimes not. Try direct
+  // first (fast path), then fall back to the proxy chain.
+  try {
+    const r = await fetch(url, { cache: "no-store" });
+    if (r.ok) return await r.text();
+  } catch (_) { /* CORS or network — try proxies */ }
+
+  let lastErr = null;
+  for (const proxy of PROXIES) {
+    try {
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 10_000);
+      const r = await fetch(proxy(url), { cache: "no-store", signal: ac.signal });
+      clearTimeout(timer);
+      if (!r.ok) { lastErr = new Error("HTTP " + r.status); continue; }
+      const t = await r.text();
+      if (t && t.includes("BEGIN:VCALENDAR")) return t;
+      lastErr = new Error("not an ICS file");
+    } catch (e) { lastErr = e; }
+  }
+  throw new Error(lastErr ? lastErr.message : "all proxies failed");
+}
+
+// Parse the VCALENDAR string and return events overlapping today (local TZ),
+// including recurring events expanded via ical.js.
+function eventsForToday(icsText) {
+  if (typeof ICAL === "undefined") throw new Error("ical.js not loaded");
+
+  const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
+  const endOfDay   = new Date(startOfDay); endOfDay.setDate(endOfDay.getDate() + 1);
+
+  const startICAL = ICAL.Time.fromJSDate(startOfDay, false);
+  const endICAL   = ICAL.Time.fromJSDate(endOfDay, false);
+
+  const jcal = ICAL.parse(icsText);
+  const comp = new ICAL.Component(jcal);
+  const vevents = comp.getAllSubcomponents("vevent");
+
+  const out = [];
+  for (const ve of vevents) {
+    let event;
+    try { event = new ICAL.Event(ve); } catch (_) { continue; }
+    if (!event.summary) continue;
+
+    if (event.isRecurring()) {
+      let iter;
+      try { iter = event.iterator(); } catch (_) { continue; }
+      let n, safety = 0;
+      while ((n = iter.next()) && safety++ < 366) {
+        if (n.compare(endICAL) >= 0) break;
+        let occ;
+        try { occ = event.getOccurrenceDetails(n); } catch (_) { continue; }
+        const s = occ.startDate.toJSDate();
+        const e = occ.endDate.toJSDate();
+        if (e <= startOfDay) continue;
+        if (s >= endOfDay)   break;
+        out.push({
+          start:  s,
+          end:    e,
+          title:  occ.item.summary || event.summary,
+          allDay: occ.startDate.isDate,
+        });
+      }
+    } else {
+      const s = event.startDate.toJSDate();
+      const e = event.endDate ? event.endDate.toJSDate() : new Date(s.getTime() + 30 * 60_000);
+      if (e <= startOfDay) continue;
+      if (s >= endOfDay)   continue;
+      out.push({
+        start:  s,
+        end:    e,
+        title:  event.summary,
+        allDay: event.startDate.isDate,
+      });
+    }
+  }
+
+  // All-day first, then chronological.
+  out.sort((a, b) => {
+    if (a.allDay !== b.allDay) return a.allDay ? -1 : 1;
+    return a.start - b.start;
+  });
+  return out;
+}
+
+function fmtTime(d) {
+  return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+          .replace(":00", "").toLowerCase().replace(/\s/g, "");
+}
+function timeLabel(ev) {
+  if (ev.allDay) return "All day";
+  const a = fmtTime(ev.start);
+  // Show just start; end optional. Keep it terse for the at-a-glance view.
+  return a;
+}
+
+function renderCalEvents(events) {
+  const now = new Date();
+  const dateLabel = now.toLocaleDateString(undefined, {
+    weekday: "long", month: "short", day: "numeric"
+  });
+
+  const rows = events.length === 0
+    ? '<div class="cal-empty">Nothing on your calendar today 🎉</div>'
+    : '<div class="cal-events">' + events.map(ev => {
+        const isNow = !ev.allDay && now >= ev.start && now < ev.end;
+        return `
+          <div class="cal-event${isNow ? " now" : ""}">
+            <div class="cal-time">${escapeHtml(timeLabel(ev))}</div>
+            <div class="cal-event-title">${escapeHtml(ev.title)}</div>
+          </div>`;
+      }).join("") + '</div>';
+
+  calCard.innerHTML = `
+    <div class="cal-head">
+      <div class="cal-title">Today <span class="date">· ${escapeHtml(dateLabel)}</span></div>
+      <div class="cal-actions">
+        <button id="cal-refresh" title="Refresh">↻</button>
+        <button id="cal-disconnect" title="Change calendar">Change</button>
+      </div>
+    </div>
+    ${rows}`;
+  $("#cal-refresh").addEventListener("click", () => loadCalendar(true));
+  $("#cal-disconnect").addEventListener("click", () => {
+    if (!confirm("Disconnect your calendar?")) return;
+    setCalUrl("");
+    try { localStorage.removeItem(CAL_CACHE_KEY); } catch (_) {}
+    renderCalSetup();
+  });
+}
+
+function renderCalError(msg) {
+  calCard.innerHTML = `
+    <div class="cal-head">
+      <div class="cal-title">Today</div>
+      <div class="cal-actions">
+        <button id="cal-retry">Retry</button>
+        <button id="cal-disconnect">Change</button>
+      </div>
+    </div>
+    <div class="cal-empty">Couldn't load your calendar: ${escapeHtml(msg)}</div>`;
+  $("#cal-retry").addEventListener("click", () => loadCalendar(true));
+  $("#cal-disconnect").addEventListener("click", () => {
+    setCalUrl(""); try { localStorage.removeItem(CAL_CACHE_KEY); } catch (_) {}
+    renderCalSetup();
+  });
+}
+
+async function loadCalendar(force) {
+  const url = getCalUrl();
+  if (!url) { renderCalSetup(); return; }
+
+  // Paint cached ICS immediately if we have a recent copy.
+  if (!force) {
+    const cached = cacheGet(CAL_CACHE_KEY);
+    if (cached && cached.data && (Date.now() - cached.ts) < CAL_CACHE_TTL_MS) {
+      try { renderCalEvents(eventsForToday(cached.data)); }
+      catch (e) { /* fall through to fresh fetch */ }
+    }
+  }
+
+  try {
+    const text = await fetchIcs(url);
+    cacheSet(CAL_CACHE_KEY, text);
+    renderCalEvents(eventsForToday(text));
+  } catch (e) {
+    // If we already painted from cache, leave it; otherwise show error.
+    if (!calCard.querySelector(".cal-events") && !calCard.querySelector(".cal-empty")?.textContent?.includes("Nothing")) {
+      renderCalError(e.message || String(e));
+    }
+  }
+}
+
+// Wait for the deferred ical.js to be ready, then start.
+window.addEventListener("DOMContentLoaded", () => {
+  loadCalendar();
+  setInterval(loadCalendar, CAL_REFRESH_MS);
+});
 </script>
 </body>
 </html>
