@@ -341,6 +341,53 @@
     user-select: none;
   }
   .cal-setup details ol { margin: 8px 0 0; padding-left: 22px; color: var(--muted); font-size: 12.5px; line-height: 1.6; }
+  .cal-setup details h4 { margin: 12px 0 4px; font-size: 12.5px; font-weight: 700; color: var(--text); }
+
+  /* Source-calendar colored dot */
+  .cal-dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    margin-right: 6px; vertical-align: middle; flex: 0 0 8px;
+  }
+
+  /* Manage / list view (multiple calendars) */
+  .cal-list { display: flex; flex-direction: column; gap: 6px; margin: 6px 0 14px; }
+  .cal-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px;
+    background: var(--bg);
+  }
+  .cal-row .cal-name { font-weight: 600; font-size: 13.5px; }
+  .cal-row .cal-url {
+    color: var(--muted); font-size: 11.5px;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    flex: 1 1 auto; min-width: 0;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .cal-row .cal-remove {
+    appearance: none; background: transparent; border: none;
+    color: var(--muted); cursor: pointer; font-size: 18px; line-height: 1;
+    padding: 4px 8px; border-radius: 6px;
+  }
+  .cal-row .cal-remove:hover { background: var(--pill); color: var(--text); }
+  .cal-add h3 { margin: 4px 0 8px; font-size: 14px; font-weight: 700; }
+  .cal-add-form {
+    display: grid; grid-template-columns: 140px 1fr auto; gap: 8px;
+  }
+  .cal-add-form input {
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 12px; font-size: 13px; font-family: inherit;
+    min-width: 0;
+  }
+  .cal-add-form input:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+  .cal-add-form button {
+    appearance: none; background: var(--accent); color: white;
+    border: none; border-radius: 8px; padding: 8px 16px;
+    font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  @media (max-width: 600px) {
+    .cal-add-form { grid-template-columns: 1fr; }
+  }
   @media (max-width: 720px) {
     .weather-card { padding: 12px 14px; gap: 12px; }
     .weather-divider { display: none; }
@@ -1044,21 +1091,26 @@ paintCachedWeather();
 loadAllWeather();
 setInterval(loadAllWeather, WEATHER_REFRESH_MS);
 
-/* ---- Calendar: "Today at a glance" (Google iCal, no OAuth) ----- */
-const CAL_URL_KEY     = "cal:v1:url";
-const CAL_CACHE_KEY   = "cal:v1:ics";
-const CAL_REFRESH_MS  = 5 * 60 * 1000;   // 5 minutes
-const CAL_CACHE_TTL_MS = 30 * 60 * 1000; // accept cached ICS up to 30 min old
+/* ---- Calendar: "Today at a glance" (multi-calendar ICS) -------- */
+const CAL_LIST_KEY       = "cal:v2:list";
+const CAL_LEGACY_URL_KEY = "cal:v1:url";
+const CAL_LEGACY_ICS_KEY = "cal:v1:ics";
+const CAL_CACHE_PREFIX   = "cal:ics:"; // per-calendar ICS cache key suffix
+const CAL_REFRESH_MS     = 5 * 60 * 1000;   // 5 minutes
+const CAL_CACHE_TTL_MS   = 30 * 60 * 1000;  // accept cached ICS up to 30 min old
+const CAL_PALETTE = [
+  "#4c8dff", "#22c55e", "#f59e0b", "#a855f7",
+  "#ec4899", "#14b8a6", "#eab308", "#ef4444",
+];
 const calCard = $("#cal-card");
 
-function getCalUrl() {
-  try { return (localStorage.getItem(CAL_URL_KEY) || "").trim(); } catch (_) { return ""; }
+function newCalId() {
+  return "cal_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
 }
-function setCalUrl(u) {
-  try {
-    if (u) localStorage.setItem(CAL_URL_KEY, u);
-    else   localStorage.removeItem(CAL_URL_KEY);
-  } catch (_) {}
+function nextCalColor(existing) {
+  const used = new Set(existing.map(c => c.color));
+  for (const c of CAL_PALETTE) if (!used.has(c)) return c;
+  return CAL_PALETTE[existing.length % CAL_PALETTE.length];
 }
 function normalizeCalUrl(u) {
   u = (u || "").trim();
@@ -1066,45 +1118,149 @@ function normalizeCalUrl(u) {
   return u;
 }
 
-function renderCalSetup(prefill) {
+// Read the calendar list; migrate from v1 (single-URL) on first read.
+function getCals() {
+  try {
+    const raw = localStorage.getItem(CAL_LIST_KEY);
+    if (raw) {
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) return arr;
+    }
+  } catch (_) {}
+
+  // One-time migration from the old single-URL key.
+  try {
+    const legacy = (localStorage.getItem(CAL_LEGACY_URL_KEY) || "").trim();
+    if (legacy) {
+      const cals = [{ id: newCalId(), name: "Personal", url: legacy, color: CAL_PALETTE[0] }];
+      localStorage.setItem(CAL_LIST_KEY, JSON.stringify(cals));
+      localStorage.removeItem(CAL_LEGACY_URL_KEY);
+      localStorage.removeItem(CAL_LEGACY_ICS_KEY); // drop stale cache (key format changed)
+      return cals;
+    }
+  } catch (_) {}
+
+  return [];
+}
+function setCals(cals) {
+  try { localStorage.setItem(CAL_LIST_KEY, JSON.stringify(cals)); } catch (_) {}
+}
+function addCal(name, url) {
+  const cals = getCals();
+  cals.push({
+    id: newCalId(),
+    name: (name || "Calendar").trim() || "Calendar",
+    url: normalizeCalUrl(url),
+    color: nextCalColor(cals),
+  });
+  setCals(cals);
+  return cals;
+}
+function removeCal(id) {
+  const cals = getCals().filter(c => c.id !== id);
+  setCals(cals);
+  try { localStorage.removeItem("news:v" + CACHE_VERSION + ":" + CAL_CACHE_PREFIX + id); } catch (_) {}
+  return cals;
+}
+
+// Shared instructions block used inside the manage / welcome views.
+const CAL_HELP_HTML = `
+  <details>
+    <summary>How to find the URL</summary>
+    <h4>Google Calendar</h4>
+    <ol>
+      <li>Open <a href="https://calendar.google.com" target="_blank" rel="noopener">Google Calendar</a> in a browser.</li>
+      <li>Click the gear (top right) → <b>Settings</b>.</li>
+      <li>Left sidebar → under <b>Settings for my calendars</b>, click the calendar.</li>
+      <li>Scroll to <b>Integrate calendar</b>.</li>
+      <li>Copy <b>Secret address in iCal format</b> (not "Public address").</li>
+    </ol>
+    <h4>Outlook / Office 365</h4>
+    <ol>
+      <li>Open <a href="https://outlook.office.com" target="_blank" rel="noopener">Outlook on the web</a>.</li>
+      <li>Click the gear (top right) → <b>View all Outlook settings</b>.</li>
+      <li><b>Calendar</b> → <b>Shared calendars</b>.</li>
+      <li>Under <b>Publish a calendar</b>, pick your calendar and permission <b>Can view all details</b>, then click <b>Publish</b>.</li>
+      <li>Copy the <b>ICS</b> link (not the HTML one). It ends in <code>/calendar.ics</code>.</li>
+    </ol>
+  </details>`;
+
+function renderCalSetup() {
   calCard.innerHTML = `
     <div class="cal-setup">
-      <h3>Connect your Google Calendar</h3>
-      <p>Paste your <b>Secret address in iCal format</b> below. It's stored only in this browser — not in the repo or on any server.</p>
-      <div class="cal-setup-form">
-        <input id="cal-input" type="url" placeholder="https://calendar.google.com/calendar/ical/…/basic.ics"
-               value="${escapeHtml(prefill || "")}" autocomplete="off" spellcheck="false">
-        <button id="cal-save">Connect</button>
+      <h3>Connect a calendar</h3>
+      <p>Paste an iCal / ICS URL. It's stored only in this browser — never in the repo or on any server.</p>
+      <div class="cal-add-form">
+        <input id="cal-input-name" type="text" placeholder="Label (e.g. Personal)" autocomplete="off" spellcheck="false" value="Personal">
+        <input id="cal-input-url" type="url" placeholder="https://…/basic.ics  or  webcal://…" autocomplete="off" spellcheck="false">
+        <button id="cal-input-save">Connect</button>
       </div>
-      <details>
-        <summary>How do I find this URL?</summary>
-        <ol>
-          <li>Open <a href="https://calendar.google.com" target="_blank" rel="noopener">Google Calendar</a> in a browser.</li>
-          <li>Click the gear (top right) → <b>Settings</b>.</li>
-          <li>In the left sidebar, under <b>Settings for my calendars</b>, click your calendar.</li>
-          <li>Scroll down to <b>Integrate calendar</b>.</li>
-          <li>Copy <b>Secret address in iCal format</b> (not "Public address").</li>
-          <li>Paste it above and click <b>Connect</b>.</li>
-        </ol>
-      </details>
+      ${CAL_HELP_HTML}
     </div>`;
-  $("#cal-save").addEventListener("click", saveCalFromInput);
-  $("#cal-input").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") saveCalFromInput();
+  bindAddCalForm();
+}
+
+function renderCalManage() {
+  const cals = getCals();
+  const rowsHtml = cals.length === 0
+    ? '<div class="cal-empty">No calendars connected.</div>'
+    : '<div class="cal-list">' + cals.map(c => `
+        <div class="cal-row" data-id="${escapeHtml(c.id)}">
+          <span class="cal-dot" style="background:${escapeHtml(c.color)}"></span>
+          <span class="cal-name">${escapeHtml(c.name)}</span>
+          <span class="cal-url" title="${escapeHtml(c.url)}">${escapeHtml(c.url)}</span>
+          <button class="cal-remove" data-remove="${escapeHtml(c.id)}" title="Remove">×</button>
+        </div>`).join("") + '</div>';
+
+  calCard.innerHTML = `
+    <div class="cal-head">
+      <div class="cal-title">Calendars</div>
+      <div class="cal-actions">
+        <button id="cal-done">Done</button>
+      </div>
+    </div>
+    ${rowsHtml}
+    <div class="cal-add">
+      <h3>Add another calendar</h3>
+      <div class="cal-add-form">
+        <input id="cal-input-name" type="text" placeholder="Label (e.g. Work)" autocomplete="off" spellcheck="false">
+        <input id="cal-input-url" type="url" placeholder="https://…/calendar.ics  or  webcal://…" autocomplete="off" spellcheck="false">
+        <button id="cal-input-save">Add</button>
+      </div>
+      ${CAL_HELP_HTML}
+    </div>`;
+  bindAddCalForm();
+  $("#cal-done").addEventListener("click", () => loadCalendar(true));
+  $$(".cal-remove").forEach(btn => {
+    btn.addEventListener("click", () => {
+      removeCal(btn.dataset.remove);
+      renderCalManage();
+    });
   });
 }
 
-function saveCalFromInput() {
-  const raw = $("#cal-input").value;
-  const u = normalizeCalUrl(raw);
-  if (!/^https?:\/\//i.test(u)) {
-    alert("That doesn't look like a calendar URL. It should start with https:// or webcal://");
-    return;
-  }
-  setCalUrl(u);
-  try { localStorage.removeItem(CAL_CACHE_KEY); } catch (_) {}
-  calCard.innerHTML = '<div class="cal-empty">Loading calendar…</div>';
-  loadCalendar();
+function bindAddCalForm() {
+  const save = () => {
+    const name = ($("#cal-input-name").value || "").trim() || "Calendar";
+    const url  = normalizeCalUrl($("#cal-input-url").value);
+    if (!/^https?:\/\//i.test(url)) {
+      alert("That doesn't look like a calendar URL. It should start with https:// or webcal://");
+      return;
+    }
+    addCal(name, url);
+    // If we just added the first calendar, drop to events view; otherwise re-render manage.
+    if (getCals().length === 1) {
+      calCard.innerHTML = '<div class="cal-empty">Loading calendar…</div>';
+      loadCalendar(true);
+    } else {
+      renderCalManage();
+      // Also kick off a fresh load in the background so the events view is current next time.
+      loadCalendar(true);
+    }
+  };
+  $("#cal-input-save").addEventListener("click", save);
+  $("#cal-input-url").addEventListener("keydown", (e) => { if (e.key === "Enter") save(); });
+  $("#cal-input-name").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#cal-input-url").focus(); });
 }
 
 async function fetchIcs(url) {
@@ -1257,39 +1413,44 @@ function timeLabel(ev) {
   return a;
 }
 
-function renderCalEvents(events) {
+function renderCalEvents(events, cals, failures) {
   const now = new Date();
   const dateLabel = now.toLocaleDateString(undefined, {
     weekday: "long", month: "short", day: "numeric"
   });
+  const colorById = Object.fromEntries(cals.map(c => [c.id, c.color]));
+  const showDots = cals.length > 1;
 
   const rows = events.length === 0
     ? '<div class="cal-empty">Nothing on your calendar today 🎉</div>'
     : '<div class="cal-events">' + events.map(ev => {
         const isNow = !ev.allDay && now >= ev.start && now < ev.end;
+        const dot = showDots
+          ? `<span class="cal-dot" style="background:${escapeHtml(colorById[ev.sourceId] || '#888')}"></span>`
+          : "";
         return `
           <div class="cal-event${isNow ? " now" : ""}">
-            <div class="cal-time">${escapeHtml(timeLabel(ev))}</div>
+            <div class="cal-time">${dot}${escapeHtml(timeLabel(ev))}</div>
             <div class="cal-event-title">${escapeHtml(ev.title)}</div>
           </div>`;
       }).join("") + '</div>';
+
+  const failureNote = (failures && failures.length)
+    ? `<div class="cal-empty" style="margin-top:8px;">Couldn't reach: ${escapeHtml(failures.map(f => f.name).join(", "))}</div>`
+    : "";
 
   calCard.innerHTML = `
     <div class="cal-head">
       <div class="cal-title">Today <span class="date">· ${escapeHtml(dateLabel)}</span></div>
       <div class="cal-actions">
         <button id="cal-refresh" title="Refresh">↻</button>
-        <button id="cal-disconnect" title="Change calendar">Change</button>
+        <button id="cal-manage" title="Manage calendars">Manage</button>
       </div>
     </div>
-    ${rows}`;
+    ${rows}
+    ${failureNote}`;
   $("#cal-refresh").addEventListener("click", () => loadCalendar(true));
-  $("#cal-disconnect").addEventListener("click", () => {
-    if (!confirm("Disconnect your calendar?")) return;
-    setCalUrl("");
-    try { localStorage.removeItem(CAL_CACHE_KEY); } catch (_) {}
-    renderCalSetup();
-  });
+  $("#cal-manage").addEventListener("click", renderCalManage);
 }
 
 function renderCalError(msg) {
@@ -1298,7 +1459,7 @@ function renderCalError(msg) {
       <div class="cal-title">Today</div>
       <div class="cal-actions">
         <button id="cal-retry">Retry</button>
-        <button id="cal-disconnect">Change</button>
+        <button id="cal-manage">Manage</button>
       </div>
     </div>
     <div class="cal-empty">Couldn't load your calendar.</div>
@@ -1309,39 +1470,66 @@ function renderCalError(msg) {
       </div>
     </details>`;
   $("#cal-retry").addEventListener("click", () => loadCalendar(true));
-  $("#cal-disconnect").addEventListener("click", () => {
-    setCalUrl(""); try { localStorage.removeItem(CAL_CACHE_KEY); } catch (_) {}
-    renderCalSetup();
+  $("#cal-manage").addEventListener("click", renderCalManage);
+}
+
+function sortEvents(events) {
+  return events.slice().sort((a, b) => {
+    if (a.allDay !== b.allDay) return a.allDay ? -1 : 1;
+    return a.start - b.start;
   });
 }
 
 async function loadCalendar(force) {
-  const url = getCalUrl();
-  if (!url) { renderCalSetup(); return; }
+  const cals = getCals();
+  if (cals.length === 0) { renderCalSetup(); return; }
 
-  // Make sure ical.js is actually loaded before we try to use it.
+  // Make sure ical.js is actually loaded before we try to parse anything.
   try { await waitForIcal(); }
   catch (e) { renderCalError(e.message); return; }
 
-  // Paint cached ICS immediately if we have a recent copy.
+  // Paint from cache first so the page is usable instantly.
   if (!force) {
-    const cached = cacheGet(CAL_CACHE_KEY);
-    if (cached && cached.data && (Date.now() - cached.ts) < CAL_CACHE_TTL_MS) {
-      try { renderCalEvents(eventsForToday(cached.data)); }
-      catch (e) { /* fall through to fresh fetch */ }
+    const cachedEvents = [];
+    for (const cal of cals) {
+      const cached = cacheGet(CAL_CACHE_PREFIX + cal.id);
+      if (!cached || !cached.data) continue;
+      if ((Date.now() - cached.ts) > CAL_CACHE_TTL_MS) continue;
+      try {
+        const evs = eventsForToday(cached.data);
+        for (const ev of evs) ev.sourceId = cal.id;
+        cachedEvents.push(...evs);
+      } catch (_) { /* parse failure — skip */ }
     }
+    if (cachedEvents.length) renderCalEvents(sortEvents(cachedEvents), cals, []);
   }
 
-  try {
-    const text = await fetchIcs(url);
-    cacheSet(CAL_CACHE_KEY, text);
-    renderCalEvents(eventsForToday(text));
-  } catch (e) {
-    // If we already painted from cache, leave it; otherwise show error.
-    if (!calCard.querySelector(".cal-events") && !calCard.querySelector(".cal-empty")?.textContent?.includes("Nothing")) {
-      renderCalError(e.message || String(e));
+  // Fetch all calendars in parallel; one slow / failed calendar doesn't
+  // block the others.
+  const results = await Promise.all(cals.map(async (cal) => {
+    try {
+      const text = await fetchIcs(cal.url);
+      cacheSet(CAL_CACHE_PREFIX + cal.id, text);
+      const evs = eventsForToday(text);
+      for (const ev of evs) ev.sourceId = cal.id;
+      return { cal, events: evs, error: null };
+    } catch (e) {
+      return { cal, events: [], error: e.message || String(e) };
     }
+  }));
+
+  const allEvents = results.flatMap(r => r.events);
+  const failures = results.filter(r => r.error).map(r => ({ name: r.cal.name, error: r.error }));
+
+  // If every calendar failed AND nothing was painted from cache, show the error.
+  const everythingFailed = failures.length === cals.length;
+  const haveCachePainted = !!calCard.querySelector(".cal-events");
+  if (everythingFailed && !haveCachePainted) {
+    renderCalError(failures.map(f => f.name + ": " + f.error).join("\n"));
+    return;
   }
+
+  renderCalEvents(sortEvents(allEvents), cals, failures);
 }
 
 // Wait for the deferred ical.js to be ready, then start.
