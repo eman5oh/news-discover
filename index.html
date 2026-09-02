@@ -530,15 +530,47 @@ function cacheSet(key, payload) {
   } catch (_) {}
 }
 
-// CORS proxy fallback chain. Tried in order — first one that returns
-// usable XML wins. Several is intentional: any single public proxy goes
-// down or rate-limits eventually.
+// CORS proxy fallback chain, fastest-first. Any single public proxy goes
+// down or rate-limits eventually, so several is intentional.
+// `unwrap` handles proxies that wrap the body in JSON.
+// (corsproxy.io was dropped — it now returns 401 without an API key.)
+// NOTE: only query-param proxies that return the body directly work here.
+// Path-style proxies (proxy.cors.sh/<url>) 302 to the origin server, and
+// the browser then blocks the redirect target for missing CORS headers.
 const PROXIES = [
-  (url) => "https://api.cors.lol/?url=" + encodeURIComponent(url),
-  (url) => "https://api.allorigins.win/raw?url=" + encodeURIComponent(url),
-  (url) => "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(url),
-  (url) => "https://corsproxy.io/?url=" + encodeURIComponent(url),
+  { name: "allorigins",
+    build: (u) => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u) },
+  { name: "whateverorigin",
+    build: (u) => "https://www.whateverorigin.org/get?url=" + encodeURIComponent(u),
+    unwrap: (t) => { try { return JSON.parse(t).contents || ""; } catch (_) { return ""; } } },
+  { name: "codetabs",
+    build: (u) => "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(u) },
+  { name: "cors.lol",
+    build: (u) => "https://api.cors.lol/?url=" + encodeURIComponent(u) },
+  { name: "allorigins-get",
+    build: (u) => "https://api.allorigins.win/get?url=" + encodeURIComponent(u) + "&disableCache=true",
+    unwrap: (t) => { try { return JSON.parse(t).contents || ""; } catch (_) { return ""; } } },
 ];
+
+// Global cap on in-flight proxy requests. Firing all ~20 feeds at once
+// makes free proxies rate-limit (429) and slow to a crawl — AllOrigins
+// degrades from 3s to a hard timeout by the third concurrent call.
+const MAX_CONCURRENT_FETCHES = 4;
+let inFlightFetches = 0;
+const fetchWaitQueue = [];
+
+function acquireFetchSlot() {
+  if (inFlightFetches < MAX_CONCURRENT_FETCHES) {
+    inFlightFetches++;
+    return Promise.resolve();
+  }
+  return new Promise(resolve => fetchWaitQueue.push(resolve));
+}
+function releaseFetchSlot() {
+  const next = fetchWaitQueue.shift();
+  if (next) next();            // hand the slot straight to the next waiter
+  else inFlightFetches--;
+}
 
 // Sports filter — applied to every column. Matches a sports keyword in the
 // title/summary OR a /sports/-style segment in the article URL.
@@ -600,11 +632,26 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", () => {
   if (!document.documentElement.dataset.theme) syncThemeButton();
 });
 syncThemeButton();
-document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && (Date.now() - lastLoadAt) > 60_000) loadAll();
-});
-
 let lastLoadAt = 0;
+let lastWeatherAt = 0;
+let lastCalAt = 0;
+
+// Browsers throttle (or entirely suspend) setInterval in background tabs,
+// so the periodic refreshes don't fire while the tab sits unfocused.
+// Catch everything up whenever the tab becomes visible again.
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  const now = Date.now();
+  if (now - lastLoadAt    > 60_000)     loadAll();
+  if (now - lastWeatherAt > 5 * 60_000) loadAllWeather();
+  if (now - lastCalAt     > 5 * 60_000) loadCalendar();
+});
+// Same catch-up when the machine wakes from sleep or regains network.
+window.addEventListener("online", () => {
+  loadAll(true);
+  loadAllWeather();
+  loadCalendar(true);
+});
 
 function setStatus(state, msg) {
   statusDot.className = "dot" + (state === "ok" ? "" : " " + state);
@@ -786,46 +833,57 @@ function parseFeed(xmlText, sourceName) {
 }
 
 // Single proxy attempt with its own abort.
-function fetchViaProxy(proxyFn, feed, timeoutMs) {
+async function fetchViaProxy(proxy, feed, timeoutMs) {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
-  return fetch(proxyFn(feed.url), { cache: "no-store", signal: ac.signal })
-    .then(r => {
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      return r.text();
-    })
-    .then(t => {
-      const items = parseFeed(t, feed.name);
-      if (items.length === 0) throw new Error("empty");
-      return items;
-    })
-    .finally(() => clearTimeout(timer));
+  try {
+    const r = await fetch(proxy.build(feed.url), { cache: "no-store", signal: ac.signal });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    let t = await r.text();
+    if (proxy.unwrap) t = proxy.unwrap(t);
+    const items = parseFeed(t, feed.name);
+    if (items.length === 0) throw new Error("empty");
+    return items;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-// Hedge the primary proxy: kick off proxy[0] immediately, and if it
-// hasn't replied in 1.5s, race proxy[1] alongside it. First success
-// wins. If both fail, fall back to the rest of the chain serially.
-// 8s per-attempt timeout keeps slow failures from stalling the page.
+// Circuit breaker: once a proxy has failed this many times in a row we
+// stop trying it for the rest of the refresh cycle. Without this, a dead
+// proxy costs (timeout x every feed) — 20 feeds x 7s x 5 proxies is
+// minutes of hanging before anything renders.
+const PROXY_FAIL_LIMIT = 2;
+let proxyFailCounts = new Map();
+
+function resetProxyBreakers() { proxyFailCounts = new Map(); }
+function proxyIsOpen(name) { return (proxyFailCounts.get(name) || 0) < PROXY_FAIL_LIMIT; }
+function noteProxyFail(name) { proxyFailCounts.set(name, (proxyFailCounts.get(name) || 0) + 1); }
+function noteProxyOk(name) { proxyFailCounts.set(name, 0); }
+
+// Walk the proxy chain in order until one returns usable items. Runs
+// inside a global concurrency slot so we never exceed
+// MAX_CONCURRENT_FETCHES in-flight proxy requests across all columns.
 async function fetchFeed(feed) {
-  const HEDGE_DELAY_MS = 1500;
-  const TIMEOUT_MS = 8000;
-
-  const primary = fetchViaProxy(PROXIES[0], feed, TIMEOUT_MS);
-  const hedged = new Promise((resolve, reject) => {
-    setTimeout(() => {
-      fetchViaProxy(PROXIES[1], feed, TIMEOUT_MS).then(resolve, reject);
-    }, HEDGE_DELAY_MS);
-  });
-
+  await acquireFetchSlot();
   try {
-    return await Promise.any([primary, hedged]);
-  } catch (_) {
     let lastErr = null;
-    for (const proxy of PROXIES.slice(2)) {
-      try { return await fetchViaProxy(proxy, feed, TIMEOUT_MS); }
-      catch (e) { lastErr = e; }
+    for (const proxy of PROXIES) {
+      if (!proxyIsOpen(proxy.name)) continue; // tripped breaker — skip
+      try {
+        const items = await fetchViaProxy(proxy, feed, 7000);
+        noteProxyOk(proxy.name);
+        return items;
+      } catch (e) {
+        // "empty" means the proxy worked but the feed had no items — that's
+        // the feed's problem, not the proxy's, so don't count it against it.
+        if (!/empty/i.test(e.message || "")) noteProxyFail(proxy.name);
+        lastErr = (e && e.name === "AbortError") ? new Error("timeout") : e;
+      }
     }
-    throw new Error(feed.name + ": " + (lastErr ? lastErr.message : "all proxies failed"));
+    throw new Error(feed.name + ": " + (lastErr ? lastErr.message : "all proxies down"));
+  } finally {
+    releaseFetchSlot();
   }
 }
 
@@ -890,6 +948,21 @@ async function loadColumn(category) {
   }
 
   const top = unique.slice(0, PER_COLUMN_MAX);
+
+  // If this refresh produced nothing but we already have headlines on
+  // screen (painted from cache), KEEP them. Blanking a good cached column
+  // because the proxies had a bad minute is the worst possible outcome.
+  if (top.length === 0 && list.querySelector(".card")) {
+    let note = list.querySelector(".stale-note");
+    if (!note) {
+      note = document.createElement("div");
+      note.className = "errbox stale-note";
+      list.prepend(note);
+    }
+    note.textContent = "Showing saved headlines — couldn't refresh right now.";
+    return { ok: false, failed: failedSources.length };
+  }
+
   renderColumnItems(category, top);
 
   // Persist the rendered items so the next page load is instant.
@@ -936,6 +1009,7 @@ function cardHtml(it) {
 async function loadAll(manual = false) {
   setStatus("ok", manual ? "Refreshing…" : "Updating…");
   refreshBtn.disabled = true;
+  resetProxyBreakers(); // give every proxy a fresh chance each cycle
 
   const results = await Promise.all([
     loadColumn("local"),
@@ -1084,6 +1158,7 @@ async function loadWeatherFor(loc) {
 }
 
 function loadAllWeather() {
+  lastWeatherAt = Date.now();
   LOCATIONS.forEach(loadWeatherFor);
 }
 
@@ -1283,7 +1358,6 @@ async function fetchIcs(url) {
     { name: "allorigins",   fn: (u) => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u) },
     { name: "allorigins-g", fn: (u) => "https://api.allorigins.win/get?url=" + encodeURIComponent(u) + "&disableCache=true" },
     { name: "cors.lol",     fn: (u) => "https://api.cors.lol/?url=" + encodeURIComponent(u) },
-    { name: "corsproxy.io", fn: (u) => "https://corsproxy.io/?url=" + encodeURIComponent(u) },
   ];
 
   // Recognise an ICS file via any of its required markers. Some proxies
@@ -1481,6 +1555,7 @@ function sortEvents(events) {
 }
 
 async function loadCalendar(force) {
+  lastCalAt = Date.now();
   const cals = getCals();
   if (cals.length === 0) { renderCalSetup(); return; }
 
