@@ -453,57 +453,21 @@
 </main>
 
 <footer>
-  Auto-refreshes every 10 minutes while open. Sources fetched via a public CORS proxy (AllOrigins).
+  Headlines refreshed server-side every ~15 minutes. Sports and paywalled sources filtered out.
 </footer>
 
 <script>
 /* ------------------------------------------------------------------
-   Discover — Cortland / Ithaca / AI
-   Pure static page. Fetches RSS via AllOrigins CORS proxy and parses
-   client-side. No API keys, no backend.
+   Discover — Cortland / Ithaca / National / AI & Tech
+
+   Headlines come from feeds.json, which a GitHub Action regenerates
+   every ~15 minutes by fetching every RSS feed server-side. That means
+   no CORS proxies, no rate limits, and one request instead of ~25.
+   The feed list lives in scripts/fetch-feeds.mjs, not here.
    ------------------------------------------------------------------ */
 
-const FEEDS = {
-  local: [
-    // Cortland (13045) — free sources only
-    { name: "Cortland Voice",     url: "https://www.cortlandvoice.com/feed/" },
-    { name: "WSYR Syracuse",      url: "https://www.localsyr.com/feed/" },
-    { name: "Syracuse.com",       url: "https://www.syracuse.com/arc/outboundfeeds/rss/?outputType=xml" },
-    // Ithaca (14850) — free sources only
-    { name: "Ithaca Voice",       url: "https://ithacavoice.org/feed/" },
-    { name: "Ithaca Times",       url: "https://www.ithaca.com/search/?f=rss&t=article&l=25&s=start_time&sd=desc" },
-    { name: "Cornell Daily Sun",  url: "https://cornellsun.com/feed/" },
-    { name: "Tompkins Weekly",    url: "https://tompkinsweekly.com/feed/" },
-  ],
-  national: [
-    { name: "NPR News",           url: "https://feeds.npr.org/1001/rss.xml" },
-    { name: "AP Top News",        url: "https://feeds.apnews.com/rss/apf-topnews" },
-    { name: "BBC US & Canada",    url: "https://feeds.bbci.co.uk/news/world/us_and_canada/rss.xml" },
-    { name: "PBS NewsHour",       url: "https://www.pbs.org/newshour/feeds/rss/headlines" },
-    { name: "CBS News",           url: "https://www.cbsnews.com/latest/rss/main" },
-    { name: "ABC News",           url: "https://abcnews.go.com/abcnews/topstories" },
-    { name: "The Guardian US",    url: "https://www.theguardian.com/us-news/rss" },
-    { name: "Reuters",            url: "https://www.reutersagency.com/feed/?best-regions=north-america&post_type=best" },
-  ],
-  tech: [
-    // AI-focused — free sources only
-    { name: "TechCrunch AI",      url: "https://techcrunch.com/category/artificial-intelligence/feed/" },
-    { name: "Ars Technica AI",    url: "https://arstechnica.com/ai/feed/" },
-    { name: "VentureBeat AI",     url: "https://venturebeat.com/category/ai/feed/" },
-    { name: "Anthropic News",     url: "https://www.anthropic.com/news/rss.xml" },
-    { name: "OpenAI Blog",        url: "https://openai.com/blog/rss.xml" },
-    { name: "Google AI",          url: "https://blog.google/technology/ai/rss/" },
-    { name: "Simon Willison",     url: "https://simonwillison.net/atom/everything/" },
-    // General tech — free sources only
-    { name: "TechCrunch",         url: "https://techcrunch.com/feed/" },
-    { name: "Ars Technica",       url: "https://feeds.arstechnica.com/arstechnica/index" },
-    { name: "Engadget",           url: "https://www.engadget.com/rss.xml" },
-    { name: "The Register",       url: "https://www.theregister.com/headlines.atom" },
-    { name: "9to5Mac",            url: "https://9to5mac.com/feed/" },
-    { name: "404 Media",          url: "https://www.404media.co/rss/" },
-    { name: "Hacker News",        url: "https://hnrss.org/frontpage" },
-  ],
-};
+const COLUMNS = ["local", "national", "tech"];
+const FEEDS_URL = "feeds.json";
 
 const PER_COLUMN_MAX = 18;
 const REFRESH_MS = 10 * 60 * 1000; // 10 minutes
@@ -528,74 +492,6 @@ function cacheSet(key, payload) {
       JSON.stringify({ ts: Date.now(), data: payload })
     );
   } catch (_) {}
-}
-
-// CORS proxy fallback chain, fastest-first. Any single public proxy goes
-// down or rate-limits eventually, so several is intentional.
-// `unwrap` handles proxies that wrap the body in JSON.
-// (corsproxy.io was dropped — it now returns 401 without an API key.)
-// NOTE: only query-param proxies that return the body directly work here.
-// Path-style proxies (proxy.cors.sh/<url>) 302 to the origin server, and
-// the browser then blocks the redirect target for missing CORS headers.
-const PROXIES = [
-  { name: "allorigins",
-    build: (u) => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u) },
-  { name: "whateverorigin",
-    build: (u) => "https://www.whateverorigin.org/get?url=" + encodeURIComponent(u),
-    unwrap: (t) => { try { return JSON.parse(t).contents || ""; } catch (_) { return ""; } } },
-  { name: "codetabs",
-    build: (u) => "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(u) },
-  { name: "cors.lol",
-    build: (u) => "https://api.cors.lol/?url=" + encodeURIComponent(u) },
-  { name: "allorigins-get",
-    build: (u) => "https://api.allorigins.win/get?url=" + encodeURIComponent(u) + "&disableCache=true",
-    unwrap: (t) => { try { return JSON.parse(t).contents || ""; } catch (_) { return ""; } } },
-];
-
-// Global cap on in-flight proxy requests. Firing all ~20 feeds at once
-// makes free proxies rate-limit (429) and slow to a crawl — AllOrigins
-// degrades from 3s to a hard timeout by the third concurrent call.
-const MAX_CONCURRENT_FETCHES = 4;
-let inFlightFetches = 0;
-const fetchWaitQueue = [];
-
-function acquireFetchSlot() {
-  if (inFlightFetches < MAX_CONCURRENT_FETCHES) {
-    inFlightFetches++;
-    return Promise.resolve();
-  }
-  return new Promise(resolve => fetchWaitQueue.push(resolve));
-}
-function releaseFetchSlot() {
-  const next = fetchWaitQueue.shift();
-  if (next) next();            // hand the slot straight to the next waiter
-  else inFlightFetches--;
-}
-
-// Sports filter — applied to every column. Matches a sports keyword in the
-// title/summary OR a /sports/-style segment in the article URL.
-const SPORTS_TEXT_RE = new RegExp(
-  "\\b(" + [
-    "sports?", "football", "basketball", "baseball", "hockey", "soccer",
-    "lacrosse", "tennis", "golf", "wrestling", "gymnastics", "volleyball",
-    "softball", "rugby", "cricket", "boxing", "MMA", "UFC", "NASCAR", "F1",
-    "athletes?", "athletics?", "athletic",
-    "NFL", "NBA", "NHL", "MLB", "MLS", "NCAA", "PGA", "LPGA", "FIFA", "UEFA", "ESPN",
-    "olympics?", "olympian", "paralympics?",
-    "quarterback", "touchdown", "halftime", "scoreless", "shutout",
-    "kickoff", "championships?", "playoffs?", "tournament", "tournaments",
-    "head coach", "coaching staff", "season opener", "season finale",
-    "cornell big red", "big red sports", "red raiders", "red dragons",
-    "ithaca bombers", "syracuse orange"
-  ].join("|") + ")\\b",
-  "i"
-);
-const SPORTS_URL_RE = /\/(sports?|football|basketball|baseball|hockey|soccer|athletics?|nfl|nba|nhl|mlb|ncaa|olympics?)(\/|-|$)/i;
-
-function isSports(it) {
-  if (it.link && SPORTS_URL_RE.test(it.link)) return true;
-  const blob = (it.title || "") + " " + (it.summary || "");
-  return SPORTS_TEXT_RE.test(blob);
 }
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -669,224 +565,6 @@ function timeAgo(dateStr) {
   return d.toLocaleDateString();
 }
 
-function stripHtml(html) {
-  if (!html) return "";
-  const tmp = document.createElement("div");
-  tmp.innerHTML = html;
-  return (tmp.textContent || tmp.innerText || "").replace(/\s+/g, " ").trim();
-}
-
-// Try to upgrade a small/thumbnail image URL to a higher-res version.
-// Conservative — falls back to the original if the pattern doesn't match.
-function upgradeImageUrl(u) {
-  if (!u) return u;
-  let r = u;
-  // WordPress thumbnail suffix: foo-300x200.jpg → foo.jpg (full size)
-  r = r.replace(/-(\d{2,4})x(\d{2,4})(\.(?:jpe?g|png|webp|gif))/i, "$3");
-  // ?w= / ?width= / ?h= / ?height= — bump small values
-  r = r.replace(/([?&](?:w|width))=(\d+)/gi, (m, p, n) =>
-    parseInt(n, 10) < 1200 ? p + "=1200" : m);
-  r = r.replace(/([?&](?:h|height))=(\d+)/gi, (m, p, n) =>
-    parseInt(n, 10) < 800 ? p + "=800" : m);
-  // ?resize=300,200 (and the URL-encoded comma variant)
-  r = r.replace(/([?&]resize)=(\d+)(?:%2C|,)(\d+)/gi, "$1=1200,800");
-  // Thumbor / Vox CDN style: /<W>x<H>/ in the path → bump if small
-  r = r.replace(/\/(\d{2,3})x(\d{2,3})\//, (m, w) =>
-    parseInt(w, 10) < 800 ? "/1200x800/" : m);
-  return r;
-}
-
-// Pull the best usable image URL out of an RSS/Atom <item>/<entry>.
-// Collects candidates from Media RSS, enclosures, iTunes, and inline <img>
-// tags, scores by known width, picks the largest, then upgrades the URL.
-function extractImage(it) {
-  const candidates = []; // { url, w }
-
-  const norm = (u) => {
-    if (!u) return "";
-    u = u.trim();
-    if (!u) return "";
-    if (u.startsWith("//")) u = "https:" + u;
-    if (!/^https?:\/\//i.test(u)) return "";
-    // Drop trackers / spacers / icons
-    if (/\b(?:spacer|pixel|1x1|blank|tracking|beacon|stat\.gif|emoji)\b/i.test(u)) return "";
-    return u;
-  };
-
-  const guessWidth = (url, attrW) => {
-    if (attrW && /^\d+$/.test(attrW)) return parseInt(attrW, 10);
-    let m = url.match(/-(\d{2,4})x\d{2,4}\.(?:jpe?g|png|webp|gif)/i);
-    if (m) return parseInt(m[1], 10);
-    m = url.match(/[?&](?:w|width)=(\d+)/i);
-    if (m) return parseInt(m[1], 10);
-    m = url.match(/\/(\d{2,4})x\d{2,4}\//);
-    if (m) return parseInt(m[1], 10);
-    return 0; // unknown
-  };
-
-  const add = (rawUrl, attrW) => {
-    const u = norm(rawUrl);
-    if (!u) return;
-    candidates.push({ url: u, w: guessWidth(u, attrW) });
-  };
-
-  // <media:content url="..." width="..." type="image/...">
-  for (const n of it.getElementsByTagNameNS("*", "content")) {
-    const t = (n.getAttribute("type") || "").toLowerCase();
-    if (t && !t.startsWith("image/")) continue;
-    add(n.getAttribute("url"), n.getAttribute("width"));
-  }
-  // <media:thumbnail url="..." width="...">
-  for (const n of it.getElementsByTagNameNS("*", "thumbnail")) {
-    add(n.getAttribute("url"), n.getAttribute("width"));
-  }
-  // <enclosure url="..." type="image/..." length="...">
-  for (const n of it.querySelectorAll("enclosure")) {
-    const t = (n.getAttribute("type") || "").toLowerCase();
-    const u = n.getAttribute("url") || "";
-    if (t.startsWith("image/") || /\.(jpe?g|png|webp|gif)(\?|$)/i.test(u)) {
-      add(u, n.getAttribute("width"));
-    }
-  }
-  // <itunes:image href="..."> (rare in news feeds, but cheap to check)
-  for (const n of it.getElementsByTagNameNS("*", "image")) {
-    add(n.getAttribute("href") || n.getAttribute("url") || n.textContent, null);
-  }
-  // <img> tags inside description / content:encoded / content / summary
-  const htmlBlobs = [
-    it.querySelector("description")?.textContent,
-    it.getElementsByTagNameNS("*", "encoded")[0]?.textContent,
-    it.querySelector("content")?.textContent,
-    it.querySelector("summary")?.textContent,
-  ].filter(Boolean);
-  const imgTagRe = /<img\b[^>]*>/gi;
-  for (const html of htmlBlobs) {
-    const tags = html.match(imgTagRe) || [];
-    for (const tag of tags) {
-      const srcM = tag.match(/\bsrc=["']([^"']+)["']/i);
-      if (!srcM) continue;
-      const wM = tag.match(/\bwidth=["']?(\d+)/i);
-      add(srcM[1], wM ? wM[1] : null);
-    }
-  }
-
-  if (candidates.length === 0) return "";
-
-  // Sort: largest known width first; unknown widths come after known widths
-  // ≥ 400, but before known small ones.
-  candidates.sort((a, b) => {
-    const sa = a.w || 250; // unknown ≈ "probably medium"
-    const sb = b.w || 250;
-    return sb - sa;
-  });
-
-  return upgradeImageUrl(candidates[0].url);
-}
-
-function parseFeed(xmlText, sourceName) {
-  const doc = new DOMParser().parseFromString(xmlText, "application/xml");
-  if (doc.querySelector("parsererror")) return [];
-  const items = [];
-
-  // RSS 2.0
-  doc.querySelectorAll("channel > item").forEach((it) => {
-    items.push({
-      title:   it.querySelector("title")?.textContent?.trim() || "(untitled)",
-      link:    it.querySelector("link")?.textContent?.trim()
-            || it.querySelector("guid")?.textContent?.trim()
-            || "#",
-      date:    it.querySelector("pubDate")?.textContent
-            || it.querySelector("dc\\:date")?.textContent
-            || "",
-      summary: stripHtml(
-                 it.querySelector("description")?.textContent
-              || it.getElementsByTagNameNS("*", "encoded")[0]?.textContent
-              || ""
-               ).slice(0, 260),
-      image:   extractImage(it),
-      source:  sourceName,
-    });
-  });
-
-  // Atom
-  if (items.length === 0) {
-    doc.querySelectorAll("entry").forEach((it) => {
-      const linkEl = it.querySelector("link[rel='alternate'], link");
-      items.push({
-        title:   it.querySelector("title")?.textContent?.trim() || "(untitled)",
-        link:    linkEl?.getAttribute("href") || "#",
-        date:    it.querySelector("updated")?.textContent
-              || it.querySelector("published")?.textContent
-              || "",
-        summary: stripHtml(
-                   it.querySelector("summary")?.textContent
-                || it.querySelector("content")?.textContent
-                || ""
-                 ).slice(0, 260),
-        image:   extractImage(it),
-        source:  sourceName,
-      });
-    });
-  }
-
-  return items;
-}
-
-// Single proxy attempt with its own abort.
-async function fetchViaProxy(proxy, feed, timeoutMs) {
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), timeoutMs);
-  try {
-    const r = await fetch(proxy.build(feed.url), { cache: "no-store", signal: ac.signal });
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    let t = await r.text();
-    if (proxy.unwrap) t = proxy.unwrap(t);
-    const items = parseFeed(t, feed.name);
-    if (items.length === 0) throw new Error("empty");
-    return items;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// Circuit breaker: once a proxy has failed this many times in a row we
-// stop trying it for the rest of the refresh cycle. Without this, a dead
-// proxy costs (timeout x every feed) — 20 feeds x 7s x 5 proxies is
-// minutes of hanging before anything renders.
-const PROXY_FAIL_LIMIT = 2;
-let proxyFailCounts = new Map();
-
-function resetProxyBreakers() { proxyFailCounts = new Map(); }
-function proxyIsOpen(name) { return (proxyFailCounts.get(name) || 0) < PROXY_FAIL_LIMIT; }
-function noteProxyFail(name) { proxyFailCounts.set(name, (proxyFailCounts.get(name) || 0) + 1); }
-function noteProxyOk(name) { proxyFailCounts.set(name, 0); }
-
-// Walk the proxy chain in order until one returns usable items. Runs
-// inside a global concurrency slot so we never exceed
-// MAX_CONCURRENT_FETCHES in-flight proxy requests across all columns.
-async function fetchFeed(feed) {
-  await acquireFetchSlot();
-  try {
-    let lastErr = null;
-    for (const proxy of PROXIES) {
-      if (!proxyIsOpen(proxy.name)) continue; // tripped breaker — skip
-      try {
-        const items = await fetchViaProxy(proxy, feed, 7000);
-        noteProxyOk(proxy.name);
-        return items;
-      } catch (e) {
-        // "empty" means the proxy worked but the feed had no items — that's
-        // the feed's problem, not the proxy's, so don't count it against it.
-        if (!/empty/i.test(e.message || "")) noteProxyFail(proxy.name);
-        lastErr = (e && e.name === "AbortError") ? new Error("timeout") : e;
-      }
-    }
-    throw new Error(feed.name + ": " + (lastErr ? lastErr.message : "all proxies down"));
-  } finally {
-    releaseFetchSlot();
-  }
-}
-
 function renderColumnItems(category, items) {
   const col = document.getElementById("col-" + category);
   const list = col.querySelector("[data-list]");
@@ -908,75 +586,6 @@ function paintCachedColumns() {
       renderColumnItems(cat, cached.data);
     }
   }
-}
-
-async function loadColumn(category) {
-  const col = document.getElementById("col-" + category);
-  const list = col.querySelector("[data-list]");
-
-  // Skeletons only when we have nothing on screen yet (no cache, no prior load).
-  if (!list.dataset.loadedOnce) {
-    list.innerHTML = Array.from({ length: 5 })
-      .map(() => '<div class="skeleton"></div>').join("");
-  }
-
-  const results = await Promise.allSettled(FEEDS[category].map(fetchFeed));
-  const items = [];
-  const failedSources = [];
-
-  results.forEach((r, i) => {
-    if (r.status === "fulfilled") items.push(...r.value);
-    else failedSources.push(FEEDS[category][i].name);
-  });
-
-  // Drop sports stories from every column.
-  const noSports = items.filter(it => !isSports(it));
-
-  // Sort newest first; items with bad/no date sink to bottom
-  noSports.sort((a, b) => {
-    const ta = new Date(a.date).getTime() || 0;
-    const tb = new Date(b.date).getTime() || 0;
-    return tb - ta;
-  });
-
-  // Dedupe by normalized title
-  const seen = new Set();
-  const unique = [];
-  for (const it of noSports) {
-    const key = (it.title || "").toLowerCase().replace(/\s+/g, " ").trim();
-    if (key && !seen.has(key)) { seen.add(key); unique.push(it); }
-  }
-
-  const top = unique.slice(0, PER_COLUMN_MAX);
-
-  // If this refresh produced nothing but we already have headlines on
-  // screen (painted from cache), KEEP them. Blanking a good cached column
-  // because the proxies had a bad minute is the worst possible outcome.
-  if (top.length === 0 && list.querySelector(".card")) {
-    let note = list.querySelector(".stale-note");
-    if (!note) {
-      note = document.createElement("div");
-      note.className = "errbox stale-note";
-      list.prepend(note);
-    }
-    note.textContent = "Showing saved headlines — couldn't refresh right now.";
-    return { ok: false, failed: failedSources.length };
-  }
-
-  renderColumnItems(category, top);
-
-  // Persist the rendered items so the next page load is instant.
-  if (top.length) cacheSet("col:" + category, top);
-
-  if (failedSources.length) {
-    const list2 = document.querySelector("#col-" + category + " [data-list]");
-    const note = document.createElement("div");
-    note.className = "errbox";
-    note.textContent = "Couldn't reach: " + failedSources.join(", ");
-    list2.appendChild(note);
-  }
-
-  return { ok: results.some(r => r.status === "fulfilled"), failed: failedSources.length };
 }
 
 function escapeHtml(s) {
@@ -1006,27 +615,64 @@ function cardHtml(it) {
     </a>`;
 }
 
+function ageLabel(ms) {
+  const m = Math.round(ms / 60_000);
+  if (m < 2)  return "just now";
+  if (m < 60) return m + " min ago";
+  const h = Math.round(m / 60);
+  if (h < 24) return h + (h === 1 ? " hour ago" : " hours ago");
+  const d = Math.round(h / 24);
+  return d + (d === 1 ? " day ago" : " days ago");
+}
+
+// One request for everything. feeds.json is regenerated server-side by a
+// GitHub Action, so there's no CORS proxy in the path any more.
 async function loadAll(manual = false) {
   setStatus("ok", manual ? "Refreshing…" : "Updating…");
   refreshBtn.disabled = true;
-  resetProxyBreakers(); // give every proxy a fresh chance each cycle
 
-  const results = await Promise.all([
-    loadColumn("local"),
-    loadColumn("national"),
-    loadColumn("tech"),
-  ]);
+  try {
+    const res = await fetch(FEEDS_URL + "?t=" + Date.now(), { cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
 
-  lastLoadAt = Date.now();
-  refreshBtn.disabled = false;
+    for (const cat of COLUMNS) {
+      const items = (data.columns && data.columns[cat]) || [];
+      if (items.length) {
+        renderColumnItems(cat, items);
+        cacheSet("col:" + cat, items);
+      } else if (!document.querySelector("#col-" + cat + " .card")) {
+        // Nothing fresh and nothing cached on screen — show the empty state.
+        renderColumnItems(cat, []);
+      }
+    }
 
-  const anyOk     = results.some(r => r.ok);
-  const anyFailed = results.some(r => r.failed);
-  const stamp = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    lastLoadAt = Date.now();
 
-  if (!anyOk)        setStatus("error", "Offline · last tried " + stamp);
-  else if (anyFailed) setStatus("stale", "Updated " + stamp + " · some sources unreachable");
-  else                setStatus("ok",    "Live · updated " + stamp);
+    const down = Object.entries(data.sourceStatus || {})
+      .filter(([, v]) => v !== "ok")
+      .map(([k]) => k);
+    const ageMs = data.generatedAt ? Date.now() - Date.parse(data.generatedAt) : null;
+    const age = ageMs == null ? "" : ageLabel(ageMs);
+
+    if (ageMs != null && ageMs > 90 * 60 * 1000) {
+      setStatus("stale", "Headlines from " + age);
+    } else if (down.length) {
+      setStatus("stale", "Updated " + age + " · " + down.length +
+                         (down.length === 1 ? " source" : " sources") + " down");
+    } else {
+      setStatus("ok", "Live · updated " + age);
+    }
+  } catch (e) {
+    // Keep whatever's on screen — a failed refresh must never blank the page.
+    const haveContent = !!document.querySelector(".card");
+    setStatus("error", haveContent
+      ? "Offline · showing saved headlines"
+      : "Couldn't load headlines");
+    if (!haveContent) for (const cat of COLUMNS) renderColumnItems(cat, []);
+  } finally {
+    refreshBtn.disabled = false;
+  }
 }
 
 // Paint anything we cached last time before kicking off the network fetch.
