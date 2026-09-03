@@ -4,26 +4,48 @@ The site has two moving parts behind it. You only have to set these up once.
 
 | Part | What it does | Cost |
 |---|---|---|
-| **GitHub Actions** | Every 15 min, fetches all 29 news feeds and commits `feeds.json`. The page reads that one file. | Free |
+| **GitHub Actions** | Every 15 min, fetches all 29 news feeds and publishes the site (`index.html` + `feeds.json`) straight to Pages. | Free |
 | **Cloudflare Worker** | Relays your calendar (browsers can't fetch calendars directly), and gives the news a live fallback. | Free |
 
 ---
 
 ## Part 1 — GitHub Actions (news)
 
-Already committed. There is one thing to check the first time.
+**Already set up and running.** Nothing to do. It's here for reference.
 
-1. Go to **https://github.com/eman5oh/news-discover/actions**
-2. If you see a banner about workflows being disabled, click **I understand my workflows, enable them**
-3. Click **Fetch feeds** in the left sidebar → **Run workflow** → **Run workflow** to trigger it once by hand
-4. After ~1 minute it should go green and produce a commit named `Update headlines`
+The **Build and deploy** workflow runs every 15 minutes. It fetches the
+feeds, assembles `index.html` + `feeds.json` into a `_site/` folder, and
+deploys that folder to GitHub Pages as an artifact.
 
-After that it runs on its own every 15 minutes.
+Nothing is committed to the repo. Pages is configured with
+`build_type: workflow` rather than serving from a branch, so the repo
+doesn't grow over time. `feeds.json` is generated, not tracked — it's
+in `.gitignore`.
+
+To refresh by hand: **Actions** → **Build and deploy** → **Run workflow**.
 
 **Two things worth knowing:**
 
-- GitHub sometimes runs scheduled jobs several minutes late when it's busy. Not a problem for headlines.
-- Scheduled workflows get **auto-disabled after 60 days of no repo activity**. The workflow's own commits count as activity, so as long as headlines keep changing it stays alive indefinitely. If you ever come back to a stale page, check the Actions tab first.
+- GitHub runs scheduled jobs several minutes late when it's busy. Not a
+  problem for headlines.
+- Scheduled workflows get **auto-disabled after 60 days of no repo
+  activity**. Since this workflow no longer commits anything, its own runs
+  may not count as activity — so if you don't touch the repo for two
+  months, check the Actions tab and re-enable it. (With the Worker
+  configured, the page still gets live headlines via **Refresh** even if
+  that happens.)
+
+### Running it locally
+
+`feeds.json` isn't in the repo, so generate it first:
+
+```bash
+npm install --no-save fast-xml-parser
+node scripts/fetch-feeds.mjs
+python3 -m http.server 8765
+```
+
+Then open http://localhost:8765.
 
 ---
 
@@ -124,7 +146,7 @@ The list of news sources appears in **two** files and they must be kept in sync:
 - `scripts/fetch-feeds.mjs` — used by the GitHub Action
 - `worker/relay.js` — used by the live fallback
 
-Edit both, commit, then re-deploy the Worker by pasting the updated file into the Cloudflare editor.
+Edit both, commit (which triggers a rebuild and redeploy), then re-deploy the Worker by pasting the updated file into the Cloudflare editor.
 
 ---
 
@@ -137,7 +159,7 @@ Your provider isn't in `CALENDAR_HOSTS` in `worker/relay.js`. Add it and redeplo
 The Relay URL isn't set, or is wrong. Check **Manage → Relay URL** is the base URL with no trailing slash, and that `/health` returns `ok` in a browser.
 
 **Headlines stuck hours behind**
-Check https://github.com/eman5oh/news-discover/actions — the schedule may have been auto-disabled after inactivity. Re-enable and run it once by hand. With the Worker configured, pressing **Refresh** gets you current headlines regardless.
+Check https://github.com/eman5oh/news-discover/actions — the **Build and deploy** schedule may have been auto-disabled after 60 days of repo inactivity, or a run may have failed. Re-enable and run it once by hand. With the Worker configured, pressing **Refresh** gets you current headlines regardless.
 
 **A source shows in the "sources down" count**
 Usually temporary — publishers rate-limit or briefly 503. If one stays down for days its feed URL probably moved, and it needs replacing in both files.
