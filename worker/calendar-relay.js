@@ -22,13 +22,14 @@
 
 // Only these hosts may be relayed, so the Worker can't be used as an open
 // proxy by anyone who finds its URL.
+// Matched as an exact hostname OR as a parent domain (".<host>" suffix),
+// so icloud.com covers its rotating p01-/p02-calendarws prefixes.
 const ALLOWED_HOSTS = [
   "calendar.google.com",
   "outlook.office365.com",
   "outlook.office.com",
   "outlook.live.com",
-  "p01-calendarws.icloud.com",
-  "caldav.icloud.com",
+  "icloud.com",
 ];
 
 export default {
