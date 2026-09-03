@@ -1,0 +1,59 @@
+name: Build and deploy
+
+on:
+  schedule:
+    # Every 15 minutes. GitHub runs scheduled jobs late when it's busy,
+    # which is fine for headlines.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:        # lets you refresh by hand
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# A newer build supersedes an in-flight older one — there's nothing to
+# preserve in a half-finished headline fetch.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install parser
+        run: npm install --no-save --no-audit --no-fund fast-xml-parser
+
+      - name: Fetch feeds
+        run: node scripts/fetch-feeds.mjs
+
+      - name: Assemble site
+        run: |
+          mkdir -p _site
+          cp index.html _site/
+          cp feeds.json _site/
+          echo "Site contents:"
+          ls -la _site
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
