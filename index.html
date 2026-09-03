@@ -625,16 +625,41 @@ function ageLabel(ms) {
   return d + (d === 1 ? " day ago" : " days ago");
 }
 
-// One request for everything. feeds.json is regenerated server-side by a
-// GitHub Action, so there's no CORS proxy in the path any more.
+// feeds.json is committed every ~15 min by a GitHub Action, so the normal
+// path is a single same-origin request with no proxy involved. If that file
+// is missing or has gone stale (the Action failed, GitHub had an incident),
+// and a Worker relay is configured, fall back to fetching the feeds live.
+const FEEDS_STALE_MS  = 45 * 60 * 1000; // beyond this, prefer a live fetch
+const FEEDS_MANUAL_MS =  5 * 60 * 1000; // Refresh button goes live past this
+
 async function loadAll(manual = false) {
   setStatus("ok", manual ? "Refreshing…" : "Updating…");
   refreshBtn.disabled = true;
 
   try {
-    const res = await fetch(FEEDS_URL + "?t=" + Date.now(), { cache: "no-store" });
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    const data = await res.json();
+    let data = null;
+    try {
+      const res = await fetch(FEEDS_URL + "?t=" + Date.now(), { cache: "no-store" });
+      if (res.ok) data = await res.json();
+    } catch (_) { /* fall through to the worker */ }
+
+    const worker = getCalWorker();
+    const ageOf = (d) => d && d.generatedAt ? Date.now() - Date.parse(d.generatedAt) : Infinity;
+    const wantLive = !data ||
+                     ageOf(data) > FEEDS_STALE_MS ||
+                     (manual && ageOf(data) > FEEDS_MANUAL_MS);
+
+    if (worker && wantLive) {
+      try {
+        const res = await fetch(worker + "/feeds", { cache: "no-store" });
+        if (res.ok) {
+          const live = await res.json();
+          if (live && live.columns) data = live;
+        }
+      } catch (_) { /* keep whatever feeds.json gave us */ }
+    }
+
+    if (!data || !data.columns) throw new Error("no feed data available");
 
     for (const cat of COLUMNS) {
       const items = (data.columns && data.columns[cat]) || [];
@@ -655,13 +680,14 @@ async function loadAll(manual = false) {
     const ageMs = data.generatedAt ? Date.now() - Date.parse(data.generatedAt) : null;
     const age = ageMs == null ? "" : ageLabel(ageMs);
 
+    const via = data.via === "worker" ? " (live)" : "";
     if (ageMs != null && ageMs > 90 * 60 * 1000) {
       setStatus("stale", "Headlines from " + age);
     } else if (down.length) {
-      setStatus("stale", "Updated " + age + " · " + down.length +
+      setStatus("stale", "Updated " + age + via + " · " + down.length +
                          (down.length === 1 ? " source" : " sources") + " down");
     } else {
-      setStatus("ok", "Live · updated " + age);
+      setStatus("ok", "Live · updated " + age + via);
     }
   } catch (e) {
     // Keep whatever's on screen — a failed refresh must never blank the page.
@@ -848,17 +874,22 @@ const CAL_PALETTE = [
 ];
 const calCard = $("#cal-card");
 
-// Optional Cloudflare Worker relay URL. Public CORS proxies are the only
-// thing standing between the browser and the calendar (Google sends no
-// CORS headers; Outlook 302s), and they're unreliable. Setting this makes
-// the calendar dependable. Stored per-device alongside the calendar list.
+// Optional Cloudflare Worker relay, used for two things:
+//  • calendar  — mandatory in practice, since Google sends no CORS header
+//                and Outlook 302s, so a browser can never fetch them
+//                directly; the public proxies that fill the gap are flaky.
+//  • /feeds    — live fallback when the committed feeds.json is stale
+//                (e.g. the scheduled Action didn't run).
+// Stored per-device. Blank is fine: the page falls back to public proxies
+// for the calendar and to feeds.json alone for news.
 const CAL_WORKER_KEY = "cal:v2:worker";
 function getCalWorker() {
-  try { return (localStorage.getItem(CAL_WORKER_KEY) || "").trim(); } catch (_) { return ""; }
+  try { return (localStorage.getItem(CAL_WORKER_KEY) || "").trim().replace(/\/+$/, ""); }
+  catch (_) { return ""; }
 }
 function setCalWorker(u) {
   try {
-    if (u) localStorage.setItem(CAL_WORKER_KEY, u.trim());
+    if (u) localStorage.setItem(CAL_WORKER_KEY, u.trim().replace(/\/+$/, ""));
     else   localStorage.removeItem(CAL_WORKER_KEY);
   } catch (_) {}
 }
@@ -988,11 +1019,13 @@ function renderCalManage() {
       </div>
       ${CAL_HELP_HTML}
 
-      <h3 style="margin-top:16px;">Relay URL <span style="font-weight:400;color:var(--muted);font-size:12px;">(optional, fixes flaky loading)</span></h3>
+      <h3 style="margin-top:16px;">Relay URL <span style="font-weight:400;color:var(--muted);font-size:12px;">(recommended)</span></h3>
       <p style="margin:0 0 8px;color:var(--muted);font-size:12.5px;line-height:1.5;">
-        Calendar providers don't allow browsers to fetch them directly, so this page
-        falls back on free public relays that are frequently rate-limited or down.
-        Paste your own Cloudflare Worker URL here to make it reliable.
+        Calendar providers don't let browsers fetch them directly, so without this the
+        page depends on free public relays that are frequently rate-limited or down.
+        Your own Cloudflare Worker makes the calendar reliable, and also gives the news
+        columns a live fallback if the scheduled refresh ever stops running.
+        Setup steps are in <code>SETUP.md</code> in the repo.
       </p>
       <div class="cal-add-form" style="grid-template-columns:1fr auto;">
         <input id="cal-worker-url" type="url" placeholder="https://your-worker.workers.dev"
@@ -1061,7 +1094,7 @@ async function fetchIcs(url) {
   // rate-limited, timing out, or blocked. See CAL_WORKER_KEY.
   const worker = getCalWorker();
   const ICS_PROXIES = [
-    ...(worker ? [{ name: "worker", fn: (u) => worker + (worker.includes("?") ? "&" : "?") + "url=" + encodeURIComponent(u) }] : []),
+    ...(worker ? [{ name: "worker", fn: (u) => worker + "/calendar?url=" + encodeURIComponent(u) }] : []),
     { name: "allorigins",   fn: (u) => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u) },
     { name: "allorigins-g", fn: (u) => "https://api.allorigins.win/get?url=" + encodeURIComponent(u) + "&disableCache=true" },
     { name: "codetabs",     fn: (u) => "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(u) },
