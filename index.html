@@ -788,16 +788,37 @@ function paintCachedWeather() {
   }
 }
 
+// Open-Meteo sometimes answers 200 with Content-Type: application/json but
+// a plain-text body ("Unexpected error while streaming data: timeoutReached").
+// So parse defensively and validate the shape rather than trusting res.json().
+async function fetchWeatherOnce(loc) {
+  const res = await fetch(weatherUrl(loc), { cache: "no-store" });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const body = await res.text();
+  let data;
+  try { data = JSON.parse(body); }
+  catch { throw new Error(body.slice(0, 60).trim() || "invalid response"); }
+  if (!data || !data.current || !data.daily) throw new Error("unexpected payload");
+  return data;
+}
+
 async function loadWeatherFor(loc) {
   const card = document.getElementById("wx-" + loc.id);
   if (!card) return;
   try {
-    const res = await fetch(weatherUrl(loc), { cache: "no-store" });
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    const data = await res.json();
+    let data;
+    try {
+      data = await fetchWeatherOnce(loc);
+    } catch (first) {
+      // The streaming error above is transient; one quick retry usually works.
+      await new Promise(r => setTimeout(r, 1500));
+      data = await fetchWeatherOnce(loc);
+    }
     cacheSet("wx:" + loc.id, data);
     renderWeather(loc, data);
   } catch (e) {
+    // Keep good cached weather on screen rather than replacing it with an error.
+    if (card.querySelector(".weather-now")) return;
     card.innerHTML =
       `<div class="weather-error">${escapeHtml(loc.name)} weather unavailable (${escapeHtml(e.message || "error")})</div>`;
   }
@@ -818,12 +839,29 @@ const CAL_LEGACY_URL_KEY = "cal:v1:url";
 const CAL_LEGACY_ICS_KEY = "cal:v1:ics";
 const CAL_CACHE_PREFIX   = "cal:ics:"; // per-calendar ICS cache key suffix
 const CAL_REFRESH_MS     = 5 * 60 * 1000;   // 5 minutes
-const CAL_CACHE_TTL_MS   = 30 * 60 * 1000;  // accept cached ICS up to 30 min old
+// Today's events barely change, and showing slightly stale events beats
+// showing none, so accept a cached ICS for most of a day.
+const CAL_CACHE_TTL_MS   = 12 * 60 * 60 * 1000;
 const CAL_PALETTE = [
   "#4c8dff", "#22c55e", "#f59e0b", "#a855f7",
   "#ec4899", "#14b8a6", "#eab308", "#ef4444",
 ];
 const calCard = $("#cal-card");
+
+// Optional Cloudflare Worker relay URL. Public CORS proxies are the only
+// thing standing between the browser and the calendar (Google sends no
+// CORS headers; Outlook 302s), and they're unreliable. Setting this makes
+// the calendar dependable. Stored per-device alongside the calendar list.
+const CAL_WORKER_KEY = "cal:v2:worker";
+function getCalWorker() {
+  try { return (localStorage.getItem(CAL_WORKER_KEY) || "").trim(); } catch (_) { return ""; }
+}
+function setCalWorker(u) {
+  try {
+    if (u) localStorage.setItem(CAL_WORKER_KEY, u.trim());
+    else   localStorage.removeItem(CAL_WORKER_KEY);
+  } catch (_) {}
+}
 
 function newCalId() {
   return "cal_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
@@ -949,8 +987,27 @@ function renderCalManage() {
         <button id="cal-input-save">Add</button>
       </div>
       ${CAL_HELP_HTML}
+
+      <h3 style="margin-top:16px;">Relay URL <span style="font-weight:400;color:var(--muted);font-size:12px;">(optional, fixes flaky loading)</span></h3>
+      <p style="margin:0 0 8px;color:var(--muted);font-size:12.5px;line-height:1.5;">
+        Calendar providers don't allow browsers to fetch them directly, so this page
+        falls back on free public relays that are frequently rate-limited or down.
+        Paste your own Cloudflare Worker URL here to make it reliable.
+      </p>
+      <div class="cal-add-form" style="grid-template-columns:1fr auto;">
+        <input id="cal-worker-url" type="url" placeholder="https://your-worker.workers.dev"
+               autocomplete="off" spellcheck="false" value="${escapeHtml(getCalWorker())}">
+        <button id="cal-worker-save">Save</button>
+      </div>
     </div>`;
   bindAddCalForm();
+  $("#cal-worker-save").addEventListener("click", () => {
+    const v = $("#cal-worker-url").value.trim();
+    if (v && !/^https?:\/\//i.test(v)) { alert("Relay URL should start with https://"); return; }
+    setCalWorker(v);
+    try { for (const c of getCals()) localStorage.removeItem("news:v" + CACHE_VERSION + ":" + CAL_CACHE_PREFIX + c.id); } catch (_) {}
+    loadCalendar(true);
+  });
   $("#cal-done").addEventListener("click", () => loadCalendar(true));
   $$(".cal-remove").forEach(btn => {
     btn.addEventListener("click", () => {
@@ -999,10 +1056,15 @@ async function fetchIcs(url) {
   // URLs and bigger response bodies than cors.lol (which returns 413 for
   // Google iCal URLs above a fairly short threshold). AllOrigins second
   // for breadth, then the rest as fallbacks.
+  // If a Cloudflare Worker URL is configured it goes first — it's the only
+  // reliable option, since the public proxies rotate through being
+  // rate-limited, timing out, or blocked. See CAL_WORKER_KEY.
+  const worker = getCalWorker();
   const ICS_PROXIES = [
-    { name: "codetabs",     fn: (u) => "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(u) },
+    ...(worker ? [{ name: "worker", fn: (u) => worker + (worker.includes("?") ? "&" : "?") + "url=" + encodeURIComponent(u) }] : []),
     { name: "allorigins",   fn: (u) => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u) },
     { name: "allorigins-g", fn: (u) => "https://api.allorigins.win/get?url=" + encodeURIComponent(u) + "&disableCache=true" },
+    { name: "codetabs",     fn: (u) => "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(u) },
     { name: "cors.lol",     fn: (u) => "https://api.cors.lol/?url=" + encodeURIComponent(u) },
   ];
 
@@ -1241,12 +1303,26 @@ async function loadCalendar(force) {
 
   const allEvents = results.flatMap(r => r.events);
   const failures = results.filter(r => r.error).map(r => ({ name: r.cal.name, error: r.error }));
-
-  // If every calendar failed AND nothing was painted from cache, show the error.
   const everythingFailed = failures.length === cals.length;
-  const haveCachePainted = !!calCard.querySelector(".cal-events");
-  if (everythingFailed && !haveCachePainted) {
-    renderCalError(failures.map(f => f.name + ": " + f.error).join("\n"));
+
+  if (everythingFailed) {
+    // NEVER fall through to a normal render here. allEvents is empty, so
+    // renderCalEvents would print "Nothing on your calendar today" — which
+    // is indistinguishable from a genuinely clear day and could make you
+    // miss a meeting. Keep whatever is already painted, or show the error.
+    const painted = calCard.querySelector(".cal-events");
+    if (painted) {
+      let note = calCard.querySelector(".cal-stale");
+      if (!note) {
+        note = document.createElement("div");
+        note.className = "cal-empty cal-stale";
+        note.style.marginTop = "8px";
+        calCard.appendChild(note);
+      }
+      note.textContent = "Showing last known events — couldn't refresh just now.";
+    } else {
+      renderCalError(failures.map(f => f.name + ": " + f.error).join(" · "));
+    }
     return;
   }
 
