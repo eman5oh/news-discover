@@ -86,7 +86,9 @@ const CALENDAR_HOSTS = [
 
 const PER_COLUMN_MAX = 24;
 const PER_SOURCE_MAX = 4;
-const FEED_TIMEOUT_MS = 12_000;
+// One slow publisher shouldn't hold up the whole response — the others
+// have already returned by then.
+const FEED_TIMEOUT_MS = 8_000;
 
 const SPORTS_TEXT_RE = new RegExp(
   "\\b(" + [
@@ -282,22 +284,32 @@ async function fetchOneFeed(feed) {
 }
 
 async function buildFeedsPayload() {
-  const columns = {};
-  const sourceStatus = {};
-
+  // Fetch every feed across all three columns in ONE parallel batch.
+  // Doing a Promise.allSettled per category serialised three rounds, so
+  // each column waited on its own slowest feed before the next started —
+  // three timeouts deep in the worst case.
+  const jobs = [];
   for (const [category, feeds] of Object.entries(FEEDS)) {
-    const settled = await Promise.allSettled(feeds.map(fetchOneFeed));
-    const items = [];
-    settled.forEach((r, i) => {
-      const name = feeds[i].name;
-      if (r.status === "fulfilled") {
-        sourceStatus[name] = "ok";
-        items.push(...r.value);
-      } else {
-        sourceStatus[name] = String(r.reason?.message || r.reason || "failed");
-      }
-    });
+    for (const feed of feeds) jobs.push({ category, feed });
+  }
+  const settled = await Promise.allSettled(jobs.map(j => fetchOneFeed(j.feed)));
 
+  const byCategory = {};
+  const sourceStatus = {};
+  settled.forEach((r, i) => {
+    const { category, feed } = jobs[i];
+    if (!byCategory[category]) byCategory[category] = [];
+    if (r.status === "fulfilled") {
+      sourceStatus[feed.name] = "ok";
+      byCategory[category].push(...r.value);
+    } else {
+      sourceStatus[feed.name] = String(r.reason?.message || r.reason || "failed");
+    }
+  });
+
+  const columns = {};
+  for (const category of Object.keys(FEEDS)) {
+    const items = byCategory[category] || [];
     const filtered = items.filter(it => !isSports(it) && !isBlockedSource(it.source));
     filtered.sort((a, b) => (Date.parse(b.date) || 0) - (Date.parse(a.date) || 0));
 

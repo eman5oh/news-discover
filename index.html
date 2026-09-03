@@ -625,77 +625,95 @@ function ageLabel(ms) {
   return d + (d === 1 ? " day ago" : " days ago");
 }
 
-// feeds.json is committed every ~15 min by a GitHub Action, so the normal
-// path is a single same-origin request with no proxy involved. If that file
-// is missing or has gone stale (the Action failed, GitHub had an incident),
-// and a Worker relay is configured, fall back to fetching the feeds live.
-const FEEDS_STALE_MS  = 45 * 60 * 1000; // beyond this, prefer a live fetch
-const FEEDS_MANUAL_MS =  5 * 60 * 1000; // Refresh button goes live past this
+// feeds.json is republished every ~15 min by the deploy workflow, so the
+// normal path is a single same-origin request with no proxy involved. If
+// that file is missing or stale (the workflow failed or was disabled), and
+// a Worker relay is configured, fetch the feeds live instead.
+const FEEDS_STALE_MS  = 45 * 60 * 1000; // beyond this, always go live
+const FEEDS_MANUAL_MS = 10 * 60 * 1000; // Refresh goes live past this
+
+// Render a payload and update the status line.
+function applyFeedData(data) {
+  for (const cat of COLUMNS) {
+    const items = (data.columns && data.columns[cat]) || [];
+    if (items.length) {
+      renderColumnItems(cat, items);
+      cacheSet("col:" + cat, items);
+    } else if (!document.querySelector("#col-" + cat + " .card")) {
+      // Nothing fresh and nothing cached on screen — show the empty state.
+      renderColumnItems(cat, []);
+    }
+  }
+  lastLoadAt = Date.now();
+
+  const down = Object.entries(data.sourceStatus || {})
+    .filter(([, v]) => v !== "ok")
+    .map(([k]) => k);
+  const ageMs = data.generatedAt ? Date.now() - Date.parse(data.generatedAt) : null;
+  const age = ageMs == null ? "" : ageLabel(ageMs);
+  const via = data.via === "worker" ? " (live)" : "";
+
+  if (ageMs != null && ageMs > 90 * 60 * 1000) {
+    setStatus("stale", "Headlines from " + age);
+  } else if (down.length) {
+    setStatus("stale", "Updated " + age + via + " · " + down.length +
+                       (down.length === 1 ? " source" : " sources") + " down");
+  } else {
+    setStatus("ok", "Live · updated " + age + via);
+  }
+}
+
+function reportNoData() {
+  const haveContent = !!document.querySelector(".card");
+  setStatus("error", haveContent
+    ? "Offline · showing saved headlines"
+    : "Couldn't load headlines");
+  if (!haveContent) for (const cat of COLUMNS) renderColumnItems(cat, []);
+}
 
 async function loadAll(manual = false) {
   setStatus("ok", manual ? "Refreshing…" : "Updating…");
   refreshBtn.disabled = true;
 
+  // Step 1: paint feeds.json straight away. It's same-origin and already
+  // built, so this is effectively instant — the page is usable before we
+  // decide whether a live fetch is even worth doing.
+  let data = null;
   try {
-    let data = null;
-    try {
-      const res = await fetch(FEEDS_URL + "?t=" + Date.now(), { cache: "no-store" });
-      if (res.ok) data = await res.json();
-    } catch (_) { /* fall through to the worker */ }
+    const res = await fetch(FEEDS_URL + "?t=" + Date.now(), { cache: "no-store" });
+    if (res.ok) data = await res.json();
+  } catch (_) { /* fall through to the worker */ }
 
-    const worker = getCalWorker();
-    const ageOf = (d) => d && d.generatedAt ? Date.now() - Date.parse(d.generatedAt) : Infinity;
-    const wantLive = !data ||
-                     ageOf(data) > FEEDS_STALE_MS ||
-                     (manual && ageOf(data) > FEEDS_MANUAL_MS);
+  if (data && data.columns) applyFeedData(data);
 
-    if (worker && wantLive) {
-      try {
-        const res = await fetch(worker + "/feeds", { cache: "no-store" });
-        if (res.ok) {
-          const live = await res.json();
-          if (live && live.columns) data = live;
-        }
-      } catch (_) { /* keep whatever feeds.json gave us */ }
+  // Step 2: upgrade to live data only when the published copy is actually
+  // old enough to matter. Refreshing minutes after a scheduled build would
+  // otherwise re-fetch 29 publishers to produce the same headlines.
+  const worker = getCalWorker();
+  const ageOf = (d) => d && d.generatedAt ? Date.now() - Date.parse(d.generatedAt) : Infinity;
+  const wantLive = worker && (!data ||
+                              ageOf(data) > FEEDS_STALE_MS ||
+                              (manual && ageOf(data) > FEEDS_MANUAL_MS));
+
+  if (!wantLive) {
+    refreshBtn.disabled = false;
+    if (!data || !data.columns) reportNoData();
+    return;
+  }
+
+  if (data && data.columns) setStatus("ok", "Checking for newer headlines…");
+  try {
+    // No cache:"no-store" here — that bypasses Cloudflare's edge cache and
+    // forces a cold 29-feed fetch on every single refresh. The Worker sets
+    // max-age=300, which is exactly the freshness we want anyway.
+    const res = await fetch(worker + "/feeds");
+    if (res.ok) {
+      const live = await res.json();
+      if (live && live.columns) { applyFeedData(live); return; }
     }
-
-    if (!data || !data.columns) throw new Error("no feed data available");
-
-    for (const cat of COLUMNS) {
-      const items = (data.columns && data.columns[cat]) || [];
-      if (items.length) {
-        renderColumnItems(cat, items);
-        cacheSet("col:" + cat, items);
-      } else if (!document.querySelector("#col-" + cat + " .card")) {
-        // Nothing fresh and nothing cached on screen — show the empty state.
-        renderColumnItems(cat, []);
-      }
-    }
-
-    lastLoadAt = Date.now();
-
-    const down = Object.entries(data.sourceStatus || {})
-      .filter(([, v]) => v !== "ok")
-      .map(([k]) => k);
-    const ageMs = data.generatedAt ? Date.now() - Date.parse(data.generatedAt) : null;
-    const age = ageMs == null ? "" : ageLabel(ageMs);
-
-    const via = data.via === "worker" ? " (live)" : "";
-    if (ageMs != null && ageMs > 90 * 60 * 1000) {
-      setStatus("stale", "Headlines from " + age);
-    } else if (down.length) {
-      setStatus("stale", "Updated " + age + via + " · " + down.length +
-                         (down.length === 1 ? " source" : " sources") + " down");
-    } else {
-      setStatus("ok", "Live · updated " + age + via);
-    }
-  } catch (e) {
-    // Keep whatever's on screen — a failed refresh must never blank the page.
-    const haveContent = !!document.querySelector(".card");
-    setStatus("error", haveContent
-      ? "Offline · showing saved headlines"
-      : "Couldn't load headlines");
-    if (!haveContent) for (const cat of COLUMNS) renderColumnItems(cat, []);
+    if (!data || !data.columns) reportNoData();
+  } catch (_) {
+    if (!data || !data.columns) reportNoData();
   } finally {
     refreshBtn.disabled = false;
   }
