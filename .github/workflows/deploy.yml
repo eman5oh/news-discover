@@ -10,7 +10,7 @@ on:
     branches: [main]
 
 permissions:
-  contents: read
+  contents: write   # for the keep-alive commit below
   pages: write
   id-token: write
 
@@ -47,6 +47,29 @@ jobs:
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site
+
+      - name: Keep the schedule alive
+        # GitHub disables scheduled workflows after 60 days of repository
+        # inactivity. This workflow deploys an artifact and never commits,
+        # so nothing was resetting that clock — it got disabled once
+        # already, and the site silently served days-old headlines.
+        #
+        # Push a dated marker when the repo has been quiet for a while.
+        # ~12 tiny commits a year, which is negligible for repo size.
+        run: |
+          LAST_COMMIT_TS=$(git log -1 --format=%ct)
+          AGE_DAYS=$(( ( $(date +%s) - LAST_COMMIT_TS ) / 86400 ))
+          echo "Last commit was ${AGE_DAYS} days ago."
+          if [ "$AGE_DAYS" -lt 25 ]; then
+            echo "Repo is active enough; no keep-alive needed."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .keepalive
+          git add .keepalive
+          git commit -m "Keep scheduled workflow alive [skip ci]"
+          git push
 
   deploy:
     needs: build

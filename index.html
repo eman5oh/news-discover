@@ -580,11 +580,22 @@ function renderColumnItems(category, items) {
 // before any network request resolves. The live fetch will replace this
 // when fresh data arrives.
 function paintCachedColumns() {
+  let painted = false;
   for (const cat of ["local", "national", "tech"]) {
     const cached = cacheGet("col:" + cat);
     if (cached && Array.isArray(cached.data) && cached.data.length) {
       renderColumnItems(cat, cached.data);
+      painted = true;
     }
+  }
+
+  // Record which payload these cached columns came from. Without this,
+  // shownGeneratedAt starts at 0 on every page load and a stale published
+  // feeds.json would repaint straight over fresher cached headlines.
+  const meta = cacheGet("feeds:meta");
+  if (painted && meta && meta.data && meta.data.generatedAt) {
+    shownGeneratedAt = Date.parse(meta.data.generatedAt) || 0;
+    shownData = meta.data;
   }
 }
 
@@ -632,8 +643,46 @@ function ageLabel(ms) {
 const FEEDS_STALE_MS  = 45 * 60 * 1000; // beyond this, always go live
 const FEEDS_MANUAL_MS = 10 * 60 * 1000; // Refresh goes live past this
 
-// Render a payload and update the status line.
+// Timestamp of the payload currently on screen, and the payload itself.
+// These exist to stop an OLDER payload from overwriting a NEWER one. The
+// published feeds.json can fall far behind (the deploy workflow gets
+// auto-disabled after 60 days of repo inactivity, which has happened), and
+// loadAll paints it before deciding whether to upgrade. Without this guard,
+// coming back to the tab repaints days-old headlines over live Worker data
+// — and worse, writes them into the localStorage cache, so the staleness
+// survives a reload.
+let shownGeneratedAt = 0;
+let shownData = null;
+
+function feedStatusLine(data) {
+  const down = Object.entries(data.sourceStatus || {})
+    .filter(([, v]) => v !== "ok")
+    .map(([k]) => k);
+  const ageMs = data.generatedAt ? Date.now() - Date.parse(data.generatedAt) : null;
+  const age = ageMs == null ? "" : ageLabel(ageMs);
+  const via = data.via === "worker" ? " (live)" : "";
+
+  if (ageMs != null && ageMs > 90 * 60 * 1000) {
+    return ["stale", "Headlines from " + age];
+  }
+  if (down.length) {
+    return ["stale", "Updated " + age + via + " · " + down.length +
+                     (down.length === 1 ? " source" : " sources") + " down"];
+  }
+  return ["ok", "Live · updated " + age + via];
+}
+
+// Render a payload and update the status line. Returns false if the payload
+// was rejected for being older than what is already displayed.
 function applyFeedData(data) {
+  const gen = data.generatedAt ? Date.parse(data.generatedAt) : 0;
+  if (gen && shownGeneratedAt && gen < shownGeneratedAt) {
+    // Older than what's on screen — don't render it and don't cache it.
+    // Keep the status honest about what the user is actually looking at.
+    if (shownData) setStatus(...feedStatusLine(shownData));
+    return false;
+  }
+
   for (const cat of COLUMNS) {
     const items = (data.columns && data.columns[cat]) || [];
     if (items.length) {
@@ -644,23 +693,20 @@ function applyFeedData(data) {
       renderColumnItems(cat, []);
     }
   }
+
+  shownGeneratedAt = gen || shownGeneratedAt;
+  shownData = data;
+  // Remember which payload the cached columns came from, so a fresh page
+  // load knows not to repaint something older over them.
+  cacheSet("feeds:meta", {
+    generatedAt:  data.generatedAt || null,
+    sourceStatus: data.sourceStatus || {},
+    via:          data.via || null,
+  });
+
   lastLoadAt = Date.now();
-
-  const down = Object.entries(data.sourceStatus || {})
-    .filter(([, v]) => v !== "ok")
-    .map(([k]) => k);
-  const ageMs = data.generatedAt ? Date.now() - Date.parse(data.generatedAt) : null;
-  const age = ageMs == null ? "" : ageLabel(ageMs);
-  const via = data.via === "worker" ? " (live)" : "";
-
-  if (ageMs != null && ageMs > 90 * 60 * 1000) {
-    setStatus("stale", "Headlines from " + age);
-  } else if (down.length) {
-    setStatus("stale", "Updated " + age + via + " · " + down.length +
-                       (down.length === 1 ? " source" : " sources") + " down");
-  } else {
-    setStatus("ok", "Live · updated " + age + via);
-  }
+  setStatus(...feedStatusLine(data));
+  return true;
 }
 
 function reportNoData() {
